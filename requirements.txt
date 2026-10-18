@@ -1,2 +1,0 @@
-ctransformers>=0.2.27
-rich>=13.0.0
