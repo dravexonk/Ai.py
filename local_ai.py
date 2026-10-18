@@ -1,69 +1,50 @@
 import sys
-import torch
+from ctransformers import AutoModelForCausalLM
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
-from transformers import AutoModelForCausalLM, AutoTokenizer, pipeline
 
-# कलरफुल आउटपुट के लिए Console इनिशियलाइज करें
 console = Console()
-
-# CPU पर थ्रेड्स लिमिट करें ताकि टर्मक्स क्रैश न हो
-torch.set_num_threads(2)
 
 console.print(
     Panel.fit(
-        "[bold cyan]⏳ Termux Local AI मॉडल लोड हो रहा है...\n[yellow]कृपया"
-        " थोड़ा धैर्य रखें, पहली बार में कुछ सेकंड लग सकते हैं।[/yellow]",
-        title="[bold green]System Status[/bold green]",
+        "[bold cyan]⏳ AI मॉडल लोड हो रहा है...[/bold cyan]\n"
+        "[yellow]पहली बार चलने पर यह ~350MB का हल्का मॉडल डाउनलोड करेगा।[/yellow]",
+        title="[bold green]Termux Direct AI[/bold green]",
         border_style="cyan",
     )
 )
 
-MODEL_ID = "Qwen/Qwen2.5-0.5B-Instruct"
-
 try:
-  tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-  model = AutoModelForCausalLM.from_pretrained(
-      MODEL_ID,
-      torch_dtype=torch.float32,
-      device_map="cpu",
-      low_cpu_mem_usage=True,
+  # बिना किसी API Key या PyTorch के सीधे GGUF मॉडल लोड करना
+  llm = AutoModelForCausalLM.from_pretrained(
+      "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+      model_file="qwen2.5-0.5b-instruct-q4_k_m.gguf",
+      model_type="qwen2",
+      gpu_layers=0,  # CPU पर चलाने के लिए
   )
-
-  pipe = pipeline(
-      "text-generation",
-      model=model,
-      tokenizer=tokenizer,
-      max_new_tokens=250,
-      do_sample=True,
-      temperature=0.7,
-      top_p=0.9,
-  )
-
-except Exception as err:
+except Exception as e:
   console.print(
-      f"\n[bold red]❌ मॉडल लोड करने में एरर आया:[/bold red] {err}\n"
+      f"\n[bold red]❌ मॉडल लोड करने में समस्या आई:[/bold red] {e}\n"
   )
   sys.exit(1)
 
-# ऐप की सुंदर Header स्क्रीन
+# इंटरफेस रिफ्रेश करें
 console.clear()
 console.print(
     Panel(
-        "[bold magenta]🤖 TERMUX LOCAL HINDI AI 🤖[/bold magenta]\n\n"
-        "[green]✔ बिना API Key के सीधे आपके फोन पर एक्टिव[/green]\n"
-        "[yellow]✔ चैट बंद करने के लिए 'exit' या 'exit()' टाइप करें[/yellow]",
+        "[bold magenta]🤖 TERMUX DIRECT HINDI AI 🤖[/bold magenta]\n\n"
+        "[green]✔ बिना PyTorch, बिना API Key के सीधे लाइब्रेरी से सक्रिय[/green]\n"
+        "[yellow]✔ बाहर निकलने के लिए 'exit' या 'बाहर' टाइप करें[/yellow]",
         title="[bold white]Welcome[/bold white]",
         border_style="bright_blue",
-        expand=False,
     )
 )
 
 # चैट लूप
 while True:
   try:
-    user_input = Prompt.ask("\n[bold bold_blue]आप[/bold bold_blue]")
+    user_input = Prompt.ask("\n[bold blue]आप[/bold blue]")
 
     if user_input.strip().lower() in [
         "exit",
@@ -83,27 +64,26 @@ while True:
     with console.status(
         "[bold green]AI सोच रहा है...[/bold green]", spinner="dots"
     ):
-      messages = [
-          {
-              "role": "system",
-              "content": (
-                  "आप एक समझदार AI हैं। यूजर के हर सवाल का जवाब स्पष्ट और"
-                  " केवल हिंदी भाषा में दें।"
-              ),
-          },
-          {"role": "user", "content": user_input},
-      ]
-
-      prompt = tokenizer.apply_chat_template(
-          messages, tokenize=False, add_generation_prompt=True
+      # एआई के लिए सिस्टम प्रॉम्प्ट
+      formatted_prompt = (
+          f"<|im_start|>system\nआप एक समझदार और मददगार AI हैं। यूजर के हर"
+          f" सवाल का जवाब केवल और केवल शुद्ध हिंदी भाषा में दें।<|im_end|>\n"
+          f"<|im_start|>user\n{user_input}<|im_end|>\n"
+          f"<|im_start|>assistant\n"
       )
-      raw_output = pipe(prompt)
-      response_text = raw_output[0]["generated_text"][len(prompt) :].strip()
 
-    # AI का रिस्पॉन्स बॉक्स के अंदर कलरफुल तरीके से दिखाएं
+      # डायरेक्ट टेक्स्ट जनरेशन
+      response_text = llm(
+          formatted_prompt,
+          max_new_tokens=250,
+          temperature=0.7,
+          stop=["<|im_end|>"],
+      )
+
+    # आउटपुट डिस्प्ले
     console.print(
         Panel(
-            f"[bold white]{response_text}[/bold white]",
+            f"[bold white]{response_text.strip()}[/bold white]",
             title="[bold green]AI Response[/bold green]",
             border_style="green",
         )
@@ -113,5 +93,5 @@ while True:
     console.print("\n\n[bold red]सेशन समाप्त किया गया।[/bold red]")
     break
   except Exception as e:
-    console.print(f"\n[bold red]⚠️ एक एरर आया:[/bold red] {e}")
+    console.print(f"\n[bold red]⚠️ त्रुटि:[/bold red] {e}")
       
