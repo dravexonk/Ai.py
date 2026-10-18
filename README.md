@@ -41,3 +41,6 @@ cd Ai.py
 
 # 4. Program run karein (Baki sabhi libraries yeh khud auto-install kar lega)
 python main.py
+
+
+<img width="1084" height="2412" alt="1000114675" src="https://github.com/user-attachments/assets/bc2b7bd6-d84f-49b1-be08-7a1e9469bcfd" />
