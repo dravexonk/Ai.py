@@ -26,6 +26,8 @@
 ​# /help - अगर कोई कमांड भूल जाएँ तो मदद देखने के लिए।
 # ​/exit या बाहर - जब चैट खत्म करके बाहर आना हो।
 
+<img width="1084" height="2412" alt="1000114675" src="https://github.com/user-attachments/assets/bc2b7bd6-d84f-49b1-be08-7a1e9469bcfd" />
+
 ## ⚙️ Quick Start Commands (टर्मक्स में चलाने के कमांड्स)
 
 अपने Termux में इन आसान कमांड्स को कॉपी करके पेस्ट करें:
@@ -41,6 +43,3 @@ cd Ai.py
 
 # 4. Program run karein (Baki sabhi libraries yeh khud auto-install kar lega)
 python main.py
-
-
-<img width="1084" height="2412" alt="1000114675" src="https://github.com/user-attachments/assets/bc2b7bd6-d84f-49b1-be08-7a1e9469bcfd" />
