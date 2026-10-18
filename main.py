@@ -6,15 +6,13 @@ Author: Modern AI Core
 Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
- - Automatic C++ System Binaries & Python Library Setup
- - Multi-Turn Conversation Memory Buffer
- - Real-Time Token Generation & Streaming Output
+ - Automatic C++ & Rust System Binaries Setup
+ - Fixed Termux Python 3.14 Compatibility (No hf-xet/maturin build errors)
 """
 
 import os
 import sys
 import subprocess
-import json
 
 # ==========================================
 # 1. SYSTEM DEPENDENCY & PACKAGE INSTALLER
@@ -23,46 +21,56 @@ import json
 def setup_environment():
     """
     Checks and automatically installs system packages via pkg (APT)
-    and PIP libraries required for C++ GGUF inference in Termux.
+    and specific wheel-compatible PIP libraries for Termux.
     """
     print("\n[+] Checking System Environment for Termux & Linux...")
     
     # System package check (Termux pkg)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        print("[+] Termux Environment Detected. Verifying system binaries...")
-        system_packages = ["clang", "cmake", "make", "python", "python-pip", "git"]
+        print("[+] Termux Environment Detected. Installing required compiler binaries...")
+        system_packages = ["clang", "cmake", "make", "python", "python-pip", "git", "binutils", "rust"]
         for pkg in system_packages:
             try:
                 subprocess.run(["pkg", "install", pkg, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
-    # Python pip packages required
-    required_pip_pkgs = {
-        "ctransformers": "ctransformers",
-        "rich": "rich",
-        "requests": "requests",
-        "tqdm": "tqdm",
-        "huggingface_hub": "huggingface_hub"
-    }
+    # Python pip packages required (Fixed versions to prevent hf-xet / rust build fails)
+    required_pip_pkgs = [
+        "ctransformers",
+        "rich",
+        "requests",
+        "tqdm",
+        "huggingface_hub<0.25.0"  # Avoids hf-xet maturin Rust build errors in Termux
+    ]
 
-    missing_pkgs = []
     import importlib.util
-    for module_name, pip_name in required_pip_pkgs.items():
-        if importlib.util.find_spec(module_name) is None:
-            missing_pkgs.append(pip_name)
+    missing = False
+    
+    # Check if critical packages are available
+    for mod in ["ctransformers", "rich", "requests", "tqdm", "huggingface_hub"]:
+        if importlib.util.find_spec(mod) is None:
+            missing = True
+            break
 
-    if missing_pkgs:
-        print(f"[!] Missing Python Libraries Found: {missing_pkgs}")
-        print("[!] Automatic Installation Starting... Please wait a moment.\n")
+    if missing:
+        print("[!] Missing or incompatible Python libraries found.")
+        print("[!] Starting auto-installation with Termux compatibility flags...\n")
         try:
-            # FIX: Pip upgrade hata diya gaya hai taaki termux error na de
-            subprocess.check_call([sys.executable, "-m", "pip", "install", *missing_pkgs])
+            # --no-build-isolation flag prevents Maturin/hf-xet build crash on Android
+            cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation"] + required_pip_pkgs
+            subprocess.check_call(cmd)
             print("\n[✔] All dependencies installed successfully!\n")
         except Exception as err:
-            print(f"\n[❌] Error installing libraries: {err}")
-            print("Please run manually: pip install ctransformers rich requests tqdm huggingface_hub")
-            sys.exit(1)
+            print(f"\n[⚠️] Direct install failed, trying fallback binary wheel flags...")
+            try:
+                cmd_fallback = [sys.executable, "-m", "pip", "install", "--prefer-binary"] + required_pip_pkgs
+                subprocess.check_call(cmd_fallback)
+                print("\n[✔] All dependencies installed successfully via fallback!\n")
+            except Exception as err2:
+                print(f"\n[❌] Error installing libraries: {err2}")
+                print("Please run manually: pip install ctransformers rich requests tqdm 'huggingface_hub<0.25.0'")
+                sys.exit(1)
 
 # Execute Environment Auto-Fix
 setup_environment()
@@ -353,3 +361,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
