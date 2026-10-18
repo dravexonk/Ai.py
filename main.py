@@ -30,7 +30,7 @@ def setup_environment():
     # System package check (Termux pkg)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         print("[+] Termux Environment Detected. Verifying system binaries...")
-        system_packages = ["clang", "cmake", "make", "python", "git"]
+        system_packages = ["clang", "cmake", "make", "python", "python-pip", "git"]
         for pkg in system_packages:
             try:
                 subprocess.run(["pkg", "install", pkg, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -56,7 +56,7 @@ def setup_environment():
         print(f"[!] Missing Python Libraries Found: {missing_pkgs}")
         print("[!] Automatic Installation Starting... Please wait a moment.\n")
         try:
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "pip"])
+            # FIX: Pip upgrade hata diya gaya hai taaki termux error na de
             subprocess.check_call([sys.executable, "-m", "pip", "install", *missing_pkgs])
             print("\n[✔] All dependencies installed successfully!\n")
         except Exception as err:
@@ -353,4 +353,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-    
