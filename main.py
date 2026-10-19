@@ -5,18 +5,65 @@ Termux Universal Local AI Engine (Advanced Multi-Model Interactive System)
 Author: Modern AI Core
 Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
+ - Self-Healing C++ Compilation Engine for Termux ARM64 Architecture
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
- - Automatic C++ & Rust System Binaries Setup
- - Fixed Termux Python 3.14 Compatibility (No hf-xet/maturin build errors)
+ - Multi-Turn Conversation Memory Buffer
+ - Real-Time Token Generation & Streaming Output
 """
 
 import os
 import sys
 import subprocess
+import importlib.util
 
 # ==========================================
-# 1. SYSTEM DEPENDENCY & PACKAGE INSTALLER
+# 1. ADVANCED AUTO-ENVIRONMENT SETUP & FIXER
 # ==========================================
+
+def run_cmd(command_list, suppress_output=False):
+    """Executes shell command safely."""
+    try:
+        stdout_target = subprocess.DEVNULL if suppress_output else None
+        stderr_target = subprocess.DEVNULL if suppress_output else None
+        return subprocess.run(command_list, check=True, stdout=stdout_target, stderr=stderr_target)
+    except Exception as e:
+        return None
+
+def verify_and_fix_ctransformers():
+    """
+    Termux missing C++ shared binary error fix.
+    Force reinstalls ctransformers from source using Termux system compilers.
+    """
+    print("\n[!] CTransformers native binaries missing for Android platform.")
+    print("[!] Initiating automatic local source compilation (Termux C++ Auto-Fix)...")
+    print("[!] Installing native compilation toolchain (clang, cmake, ninja)...")
+    
+    # 1. Install system compilers via Termux pkg
+    if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
+        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-dev", "-y"])
+    
+    # 2. Reinstall ctransformers without binary isolation
+    print("[!] Compiling ctransformers C++ engine locally for ARM64...")
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
+        subprocess.check_call([
+            sys.executable, "-m", "pip", "install", 
+            "ctransformers", "--no-build-isolation", "--no-binary", "ctransformers"
+        ])
+        print("\n[✔] CTransformers C++ core compiled successfully!\n")
+    except Exception as err:
+        print(f"\n[❌] Source compilation failed: {err}")
+        print("[!] Attempting secondary fallback build flag...")
+        try:
+            subprocess.check_call([
+                sys.executable, "-m", "pip", "install", 
+                "ctransformers", "--no-deps", "--force-reinstall"
+            ])
+        except Exception:
+            print("\n[❌] Critical: Manual fix needed. Please run:")
+            print("    pkg install clang cmake make -y")
+            print("    pip install ctransformers --no-build-isolation --no-binary ctransformers")
+            sys.exit(1)
 
 def setup_environment():
     """
@@ -27,62 +74,53 @@ def setup_environment():
     
     # System package check (Termux pkg)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        print("[+] Termux Environment Detected. Installing required compiler binaries...")
-        system_packages = ["clang", "cmake", "make", "python", "python-pip", "git", "binutils", "rust"]
+        print("[+] Termux Environment Detected. Ensuring compiler binaries...")
+        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
         for pkg in system_packages:
             try:
                 subprocess.run(["pkg", "install", pkg, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
             except Exception:
                 pass
 
-    # Python pip packages required (Fixed versions to prevent hf-xet / rust build fails)
+    # Python pip packages required
     required_pip_pkgs = [
         "ctransformers",
         "rich",
         "requests",
         "tqdm",
-        "huggingface_hub<0.25.0"  # Avoids hf-xet maturin Rust build errors in Termux
+        "huggingface_hub<0.25.0"  # Prevents hf-xet/maturin rust build crashes
     ]
 
-    import importlib.util
     missing = False
-    
-    # Check if critical packages are available
     for mod in ["ctransformers", "rich", "requests", "tqdm", "huggingface_hub"]:
         if importlib.util.find_spec(mod) is None:
             missing = True
             break
 
     if missing:
-        print("[!] Missing or incompatible Python libraries found.")
-        print("[!] Starting auto-installation with Termux compatibility flags...\n")
+        print("[!] Missing Python libraries detected.")
+        print("[!] Installing missing dependencies with Termux flags...\n")
         try:
-            # --no-build-isolation flag prevents Maturin/hf-xet build crash on Android
             cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation"] + required_pip_pkgs
             subprocess.check_call(cmd)
-            print("\n[✔] All dependencies installed successfully!\n")
-        except Exception as err:
-            print(f"\n[⚠️] Direct install failed, trying fallback binary wheel flags...")
+            print("\n[✔] Libraries installed successfully!\n")
+        except Exception:
             try:
                 cmd_fallback = [sys.executable, "-m", "pip", "install", "--prefer-binary"] + required_pip_pkgs
                 subprocess.check_call(cmd_fallback)
-                print("\n[✔] All dependencies installed successfully via fallback!\n")
-            except Exception as err2:
-                print(f"\n[❌] Error installing libraries: {err2}")
-                print("Please run manually: pip install ctransformers rich requests tqdm 'huggingface_hub<0.25.0'")
-                sys.exit(1)
+            except Exception as e:
+                print(f"\n[⚠️] Dependency installation warning: {e}")
 
-# Execute Environment Auto-Fix
+# Execute Initial Setup
 setup_environment()
 
-# Import Installed Libraries
+# Import Installed Libraries Safely
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
 from rich.markdown import Markdown
 from rich.table import Table
 from huggingface_hub import hf_hub_download
-from ctransformers import AutoModelForCausalLM
 
 console = Console()
 
@@ -116,7 +154,7 @@ PREDEFINED_MODELS = {
         "size": "~1.1 GB"
     },
     "4": {
-        "title": "Llama 3.2 1B Instruct (Meta's Latest Small LLM)",
+        "title": "Llama 3.2 1B Instruct (Meta's Small LLM)",
         "repo_id": "bartowski/Llama-3.2-1B-Instruct-GGUF",
         "filename": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
         "model_type": "llama",
@@ -152,9 +190,7 @@ def display_header():
     )
 
 def download_hf_model(repo_id, filename):
-    """
-    Downloads a model from Hugging Face Hub directly into local storage.
-    """
+    """Downloads model file from Hugging Face directly into local folder."""
     local_path = os.path.join(MODELS_DIRECTORY, filename)
     if os.path.exists(local_path):
         console.print(f"\n[bold green]✔ Model file exists locally: {filename}[/bold green]")
@@ -180,10 +216,7 @@ def download_hf_model(repo_id, filename):
         sys.exit(1)
 
 def model_selection_menu():
-    """
-    Presents an interactive menu allowing the user to select predefined models
-    or enter custom Hugging Face GGUF repository parameters.
-    """
+    """Interactive menu for model choices."""
     display_header()
     
     table = Table(title="[bold cyan]Select AI Model to Download or Run[/bold cyan]", border_style="cyan")
@@ -194,7 +227,7 @@ def model_selection_menu():
     for key, data in PREDEFINED_MODELS.items():
         table.add_row(key, data["title"], data["size"])
     
-    table.add_row("C", "Custom HuggingFace GGUF Repo (Enter your own Repo & File)", "Custom")
+    table.add_row("C", "Custom HuggingFace GGUF Repo (Enter Custom Repo & File)", "Custom")
     
     console.print(table)
 
@@ -208,7 +241,7 @@ def model_selection_menu():
         console.print("\n[bold cyan]--- Custom HuggingFace GGUF Setup ---[/bold cyan]")
         repo_id = Prompt.ask("Enter HuggingFace Repo ID (e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF)")
         filename = Prompt.ask("Enter exact GGUF File Name (e.g. qwen2.5-0.5b-instruct-q4_k_m.gguf)")
-        model_type = Prompt.ask("Enter Model Architecture Type (llama / qwen2 / mistral / gemma)", default="llama")
+        model_type = Prompt.ask("Enter Model Architecture Type (llama / qwen2 / mistral)", default="llama")
         
         file_path = download_hf_model(repo_id.strip(), filename.strip())
         return file_path, model_type.strip(), filename.strip()
@@ -218,12 +251,12 @@ def model_selection_menu():
         return file_path, selected["model_type"], selected["filename"]
 
 # ==========================================
-# 4. INFERENCE ENGINE & CHAT LOOP
+# 4. INFERENCE ENGINE & LOAD MANAGEMENT
 # ==========================================
 
 def initialize_model(model_path, model_type):
     """
-    Loads quantized GGUF binary using CTransformers.
+    Loads quantized GGUF model with dynamic error catching and auto-repair.
     """
     console.print(
         Panel.fit(
@@ -235,22 +268,28 @@ def initialize_model(model_path, model_type):
         )
     )
 
-    try:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            model_type=model_type,
-            gpu_layers=0,
-            context_length=2048
-        )
-        return model
-    except Exception as error:
-        console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error}")
-        sys.exit(1)
+    # Retry Mechanism to Auto-Fix Missing C++ Binaries
+    for attempt in range(2):
+        try:
+            from ctransformers import AutoModelForCausalLM
+            model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                model_type=model_type,
+                gpu_layers=0,
+                context_length=2048
+            )
+            return model
+        except Exception as error:
+            error_msg = str(error)
+            if "Precompiled binaries are not available" in error_msg or "DLL load failed" in error_msg or attempt == 0:
+                console.print(f"\n[bold yellow]⚠️ CTransformers Binary Error Detected:[/bold yellow] {error}")
+                verify_and_fix_ctransformers()
+            else:
+                console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error}")
+                sys.exit(1)
 
 def run_chat_loop(model, model_filename):
-    """
-    Executes multi-turn conversation loop with context history and live streaming output.
-    """
+    """Executes chat session with context buffer and streaming tokens."""
     console.clear()
     console.print(
         Panel(
@@ -300,10 +339,10 @@ def run_chat_loop(model, model_filename):
                 )
                 continue
 
-            # Store user message into history
+            # Store user input
             chat_history.append({"role": "user", "content": cleaned_input})
 
-            # Format full context prompt using ChatML structure
+            # Format ChatML Prompt Structure
             formatted_prompt = f"<|im_start|>system\n{SYSTEM_INSTRUCTION}<|im_end|>\n"
             for msg in chat_history:
                 role = msg["role"]
@@ -330,7 +369,6 @@ def run_chat_loop(model, model_filename):
                 print()
 
             except Exception:
-                # Fallback to direct completion if streaming fails
                 raw_response = model(
                     formatted_prompt,
                     max_new_tokens=512,
@@ -341,7 +379,7 @@ def run_chat_loop(model, model_filename):
                 full_response = raw_response.strip()
                 console.print(Markdown(full_response))
 
-            # Store AI response into context memory
+            # Save AI response into history
             chat_history.append({"role": "assistant", "content": full_response.strip()})
 
         except KeyboardInterrupt:
@@ -351,7 +389,7 @@ def run_chat_loop(model, model_filename):
             console.print(f"\n[bold red]⚠️ Generation Error:[/bold red] {error}")
 
 # ==========================================
-# 5. ENTRY POINT
+# 5. MAIN EXECUTION ENTRY POINT
 # ==========================================
 
 def main():
@@ -361,4 +399,3 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
