@@ -7,8 +7,7 @@ Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
  - Self-Healing C++ Compilation Engine for Termux ARM64 Architecture
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
- - Multi-Turn Conversation Memory Buffer
- - Real-Time Token Generation & Streaming Output
+ - Multi-Turn Conversation Memory Buffer & Null-Safety
 """
 
 import os
@@ -26,7 +25,7 @@ def run_cmd(command_list, suppress_output=False):
         stdout_target = subprocess.DEVNULL if suppress_output else None
         stderr_target = subprocess.DEVNULL if suppress_output else None
         return subprocess.run(command_list, check=True, stdout=stdout_target, stderr=stderr_target)
-    except Exception as e:
+    except Exception:
         return None
 
 def verify_and_fix_ctransformers():
@@ -36,14 +35,10 @@ def verify_and_fix_ctransformers():
     """
     print("\n[!] CTransformers native binaries missing for Android platform.")
     print("[!] Initiating automatic local source compilation (Termux C++ Auto-Fix)...")
-    print("[!] Installing native compilation toolchain (clang, cmake, ninja)...")
     
-    # 1. Install system compilers via Termux pkg
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-dev", "-y"])
     
-    # 2. Reinstall ctransformers without binary isolation
-    print("[!] Compiling ctransformers C++ engine locally for ARM64...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
         subprocess.check_call([
@@ -53,28 +48,13 @@ def verify_and_fix_ctransformers():
         print("\n[✔] CTransformers C++ core compiled successfully!\n")
     except Exception as err:
         print(f"\n[❌] Source compilation failed: {err}")
-        print("[!] Attempting secondary fallback build flag...")
-        try:
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", 
-                "ctransformers", "--no-deps", "--force-reinstall"
-            ])
-        except Exception:
-            print("\n[❌] Critical: Manual fix needed. Please run:")
-            print("    pkg install clang cmake make -y")
-            print("    pip install ctransformers --no-build-isolation --no-binary ctransformers")
-            sys.exit(1)
+        sys.exit(1)
 
 def setup_environment():
-    """
-    Checks and automatically installs system packages via pkg (APT)
-    and specific wheel-compatible PIP libraries for Termux.
-    """
+    """Checks and automatically installs required PIP libraries for Termux."""
     print("\n[+] Checking System Environment for Termux & Linux...")
     
-    # System package check (Termux pkg)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        print("[+] Termux Environment Detected. Ensuring compiler binaries...")
         system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
         for pkg in system_packages:
             try:
@@ -82,13 +62,12 @@ def setup_environment():
             except Exception:
                 pass
 
-    # Python pip packages required
     required_pip_pkgs = [
         "ctransformers",
         "rich",
         "requests",
         "tqdm",
-        "huggingface_hub<0.25.0"  # Prevents hf-xet/maturin rust build crashes
+        "huggingface_hub<0.25.0"
     ]
 
     missing = False
@@ -98,8 +77,7 @@ def setup_environment():
             break
 
     if missing:
-        print("[!] Missing Python libraries detected.")
-        print("[!] Installing missing dependencies with Termux flags...\n")
+        print("[!] Missing Python libraries detected. Installing...")
         try:
             cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation"] + required_pip_pkgs
             subprocess.check_call(cmd)
@@ -114,7 +92,6 @@ def setup_environment():
 # Execute Initial Setup
 setup_environment()
 
-# Import Installed Libraries Safely
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -172,7 +149,6 @@ SYSTEM_INSTRUCTION = (
 # ==========================================
 
 def display_header():
-    """Displays terminal ASCII Header Banner."""
     console.clear()
     banner = (
         "[bold magenta]🤖 TERMUX LOCAL AI ENGINE (OFFLINE CORE) 🤖[/bold magenta]\n\n"
@@ -190,7 +166,6 @@ def display_header():
     )
 
 def download_hf_model(repo_id, filename):
-    """Downloads model file from Hugging Face directly into local folder."""
     local_path = os.path.join(MODELS_DIRECTORY, filename)
     if os.path.exists(local_path):
         console.print(f"\n[bold green]✔ Model file exists locally: {filename}[/bold green]")
@@ -216,7 +191,6 @@ def download_hf_model(repo_id, filename):
         sys.exit(1)
 
 def model_selection_menu():
-    """Interactive menu for model choices."""
     display_header()
     
     table = Table(title="[bold cyan]Select AI Model to Download or Run[/bold cyan]", border_style="cyan")
@@ -255,9 +229,6 @@ def model_selection_menu():
 # ==========================================
 
 def initialize_model(model_path, model_type):
-    """
-    Loads quantized GGUF model with dynamic error catching and auto-repair.
-    """
     console.print(
         Panel.fit(
             f"[bold cyan]⏳ Loading GGUF Model into RAM...[/bold cyan]\n"
@@ -268,7 +239,6 @@ def initialize_model(model_path, model_type):
         )
     )
 
-    # Retry Mechanism to Auto-Fix Missing C++ Binaries
     for attempt in range(2):
         try:
             from ctransformers import AutoModelForCausalLM
@@ -278,18 +248,23 @@ def initialize_model(model_path, model_type):
                 gpu_layers=0,
                 context_length=2048
             )
+            if model is None:
+                raise Exception("Model instance returned None.")
             return model
         except Exception as error:
             error_msg = str(error)
-            if "Precompiled binaries are not available" in error_msg or "DLL load failed" in error_msg or attempt == 0:
-                console.print(f"\n[bold yellow]⚠️ CTransformers Binary Error Detected:[/bold yellow] {error}")
+            if attempt == 0:
+                console.print(f"\n[bold yellow]⚠️ Model Load Error Detected:[/bold yellow] {error}")
                 verify_and_fix_ctransformers()
             else:
                 console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error}")
                 sys.exit(1)
 
 def run_chat_loop(model, model_filename):
-    """Executes chat session with context buffer and streaming tokens."""
+    if model is None:
+        console.print("[bold red]❌ Error: Model is not initialized properly![/bold red]")
+        sys.exit(1)
+
     console.clear()
     console.print(
         Panel(
@@ -339,10 +314,8 @@ def run_chat_loop(model, model_filename):
                 )
                 continue
 
-            # Store user input
             chat_history.append({"role": "user", "content": cleaned_input})
 
-            # Format ChatML Prompt Structure
             formatted_prompt = f"<|im_start|>system\n{SYSTEM_INSTRUCTION}<|im_end|>\n"
             for msg in chat_history:
                 role = msg["role"]
@@ -353,7 +326,6 @@ def run_chat_loop(model, model_filename):
             console.print("\n[bold green]AI Response:[/bold green]", end=" ")
             full_response = ""
 
-            # Real-Time Token Generation via Streaming
             try:
                 stream = model(
                     formatted_prompt,
@@ -363,11 +335,13 @@ def run_chat_loop(model, model_filename):
                     top_p=0.9,
                     stop=["<|im_end|>"]
                 )
-                for token in stream:
-                    full_response += token
-                    print(token, end="", flush=True)
-                print()
-
+                if stream is not None:
+                    for token in stream:
+                        full_response += token
+                        print(token, end="", flush=True)
+                    print()
+                else:
+                    raise Exception("Stream returned None")
             except Exception:
                 raw_response = model(
                     formatted_prompt,
@@ -376,10 +350,13 @@ def run_chat_loop(model, model_filename):
                     top_p=0.9,
                     stop=["<|im_end|>"]
                 )
-                full_response = raw_response.strip()
-                console.print(Markdown(full_response))
+                if raw_response:
+                    full_response = raw_response.strip()
+                    console.print(Markdown(full_response))
+                else:
+                    full_response = "Error generating response."
+                    console.print("[red]Error generating response[/red]")
 
-            # Save AI response into history
             chat_history.append({"role": "assistant", "content": full_response.strip()})
 
         except KeyboardInterrupt:
@@ -399,3 +376,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
