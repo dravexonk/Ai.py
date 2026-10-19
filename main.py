@@ -5,7 +5,7 @@ Termux Universal Local AI Engine (Advanced Multi-Model Interactive System)
 Author: Modern AI Core
 Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
- - Self-Healing C++ Compilation Engine for Termux ARM64 Architecture
+ - Self-Healing C++ Compilation Engine with scikit-build support
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
  - Multi-Turn Conversation Memory Buffer & Safe NoneType Error Prevention
 """
@@ -30,21 +30,18 @@ def run_cmd(command_list, suppress_output=False):
 
 def verify_and_fix_ctransformers():
     """
-    Termux missing C++ shared binary error fix.
-    Force reinstalls ctransformers from source using Termux system compilers and setuptools.
+    Termux missing C++ shared binary & skbuild error fix.
+    Installs scikit-build, cmake, and reinstalls ctransformers.
     """
-    print("\n[!] CTransformers native binaries missing for Android platform.")
-    print("[!] Initiating automatic local source compilation (Termux C++ Auto-Fix)...")
-    print("[!] Installing native compilation toolchain (clang, cmake, ninja, setuptools)...")
+    print("\n[!] CTransformers native binaries or build modules missing.")
+    print("[!] Initiating automatic toolchain setup (scikit-build, cmake, clang)...")
     
-    # 1. Install system compilers via Termux pkg (Removed python-dev as it does not exist)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-pip", "python-setuptools", "python-wheel", "-y"], suppress_output=False)
+        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils", "-y"], suppress_output=False)
     
-    # Ensure setuptools and wheel are upgraded in pip
-    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+    # Ensure build prerequisites are present in Python
+    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "scikit-build"])
 
-    # 2. Reinstall ctransformers without binary isolation
     print("[!] Compiling ctransformers C++ engine locally for ARM64...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
@@ -66,20 +63,20 @@ def verify_and_fix_ctransformers():
 
 def setup_environment():
     """
-    Checks and automatically installs system packages via pkg (APT)
-    and specific wheel-compatible PIP libraries for Termux.
+    Checks and automatically installs system packages and PIP libraries.
     """
     print("\n[+] Checking System Environment for Termux & Linux...")
     
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         print("[+] Termux Environment Detected. Ensuring compiler binaries...")
-        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "python-setuptools", "python-wheel", "git", "binutils"]
+        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
         for pkg in system_packages:
             run_cmd(["pkg", "install", pkg, "-y"])
 
     required_pip_pkgs = [
         "setuptools",
         "wheel",
+        "scikit-build",
         "ctransformers",
         "rich",
         "requests",
@@ -88,14 +85,13 @@ def setup_environment():
     ]
 
     missing = False
-    for mod in ["ctransformers", "rich", "requests", "tqdm", "huggingface_hub"]:
+    for mod in ["ctransformers", "rich", "requests", "tqdm", "huggingface_hub", "skbuild"]:
         if importlib.util.find_spec(mod) is None:
             missing = True
             break
 
     if missing:
-        print("[!] Missing Python libraries detected.")
-        print("[!] Installing missing dependencies with Termux flags...\n")
+        print("[!] Missing Python libraries detected. Installing...")
         try:
             cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation"] + required_pip_pkgs
             subprocess.check_call(cmd)
@@ -399,4 +395,4 @@ def main():
 
 if __name__ == "__main__":
     main()
- 
+         
