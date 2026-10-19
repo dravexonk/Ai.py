@@ -7,8 +7,7 @@ Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
  - Self-Healing C++ Compilation Engine for Termux ARM64 Architecture
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
- - Multi-Turn Conversation Memory Buffer
- - Real-Time Token Generation & Streaming Output
+ - Multi-Turn Conversation Memory Buffer & Safe NoneType Error Prevention
 """
 
 import os
@@ -38,11 +37,9 @@ def verify_and_fix_ctransformers():
     print("[!] Initiating automatic local source compilation (Termux C++ Auto-Fix)...")
     print("[!] Installing native compilation toolchain (clang, cmake, ninja)...")
     
-    # 1. Install system compilers via Termux pkg
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-dev", "-y"])
     
-    # 2. Reinstall ctransformers without binary isolation
     print("[!] Compiling ctransformers C++ engine locally for ARM64...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
@@ -53,7 +50,6 @@ def verify_and_fix_ctransformers():
         print("\n[✔] CTransformers C++ core compiled successfully!\n")
     except Exception as err:
         print(f"\n[❌] Source compilation failed: {err}")
-        print("[!] Attempting secondary fallback build flag...")
         try:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install", 
@@ -72,7 +68,6 @@ def setup_environment():
     """
     print("\n[+] Checking System Environment for Termux & Linux...")
     
-    # System package check (Termux pkg)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         print("[+] Termux Environment Detected. Ensuring compiler binaries...")
         system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
@@ -82,13 +77,12 @@ def setup_environment():
             except Exception:
                 pass
 
-    # Python pip packages required
     required_pip_pkgs = [
         "ctransformers",
         "rich",
         "requests",
         "tqdm",
-        "huggingface_hub<0.25.0"  # Prevents hf-xet/maturin rust build crashes
+        "huggingface_hub<0.25.0"
     ]
 
     missing = False
@@ -111,10 +105,8 @@ def setup_environment():
             except Exception as e:
                 print(f"\n[⚠️] Dependency installation warning: {e}")
 
-# Execute Initial Setup
 setup_environment()
 
-# Import Installed Libraries Safely
 from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Prompt
@@ -172,7 +164,6 @@ SYSTEM_INSTRUCTION = (
 # ==========================================
 
 def display_header():
-    """Displays terminal ASCII Header Banner."""
     console.clear()
     banner = (
         "[bold magenta]🤖 TERMUX LOCAL AI ENGINE (OFFLINE CORE) 🤖[/bold magenta]\n\n"
@@ -190,11 +181,14 @@ def display_header():
     )
 
 def download_hf_model(repo_id, filename):
-    """Downloads model file from Hugging Face directly into local folder."""
     local_path = os.path.join(MODELS_DIRECTORY, filename)
     if os.path.exists(local_path):
-        console.print(f"\n[bold green]✔ Model file exists locally: {filename}[/bold green]")
-        return local_path
+        if os.path.getsize(local_path) > 1024 * 1024:
+            console.print(f"\n[bold green]✔ Model file exists locally: {filename}[/bold green]")
+            return local_path
+        else:
+            console.print(f"\n[bold yellow]⚠️ File is corrupted. Re-downloading...[/bold yellow]")
+            os.remove(local_path)
 
     console.print(f"\n[bold yellow]📥 Downloading from Hugging Face...[/bold yellow]")
     console.print(f"[cyan]Repo ID:[/cyan] {repo_id}")
@@ -216,7 +210,6 @@ def download_hf_model(repo_id, filename):
         sys.exit(1)
 
 def model_selection_menu():
-    """Interactive menu for model choices."""
     display_header()
     
     table = Table(title="[bold cyan]Select AI Model to Download or Run[/bold cyan]", border_style="cyan")
@@ -255,9 +248,6 @@ def model_selection_menu():
 # ==========================================
 
 def initialize_model(model_path, model_type):
-    """
-    Loads quantized GGUF model with dynamic error catching and auto-repair.
-    """
     console.print(
         Panel.fit(
             f"[bold cyan]⏳ Loading GGUF Model into RAM...[/bold cyan]\n"
@@ -268,7 +258,6 @@ def initialize_model(model_path, model_type):
         )
     )
 
-    # Retry Mechanism to Auto-Fix Missing C++ Binaries
     for attempt in range(2):
         try:
             from ctransformers import AutoModelForCausalLM
@@ -278,18 +267,23 @@ def initialize_model(model_path, model_type):
                 gpu_layers=0,
                 context_length=2048
             )
+            if model is None:
+                raise Exception("Model returned None object.")
             return model
         except Exception as error:
             error_msg = str(error)
-            if "Precompiled binaries are not available" in error_msg or "DLL load failed" in error_msg or attempt == 0:
-                console.print(f"\n[bold yellow]⚠️ CTransformers Binary Error Detected:[/bold yellow] {error}")
+            if attempt == 0:
+                console.print(f"\n[bold yellow]⚠️ Binary/Load Warning Detected:[/bold yellow] {error_msg}")
                 verify_and_fix_ctransformers()
             else:
-                console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error}")
+                console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error_msg}")
+                console.print("[yellow]Tip: Model file corrupt ho sakti hai. 'downloaded_models/' se file delete karke dobara run karein.[/yellow]")
                 sys.exit(1)
+                
+    console.print(f"\n[bold red]❌ Critical Error: Model could not be initialized.[/bold red]")
+    sys.exit(1)
 
 def run_chat_loop(model, model_filename):
-    """Executes chat session with context buffer and streaming tokens."""
     console.clear()
     console.print(
         Panel(
@@ -339,10 +333,8 @@ def run_chat_loop(model, model_filename):
                 )
                 continue
 
-            # Store user input
             chat_history.append({"role": "user", "content": cleaned_input})
 
-            # Format ChatML Prompt Structure
             formatted_prompt = f"<|im_start|>system\n{SYSTEM_INSTRUCTION}<|im_end|>\n"
             for msg in chat_history:
                 role = msg["role"]
@@ -353,8 +345,10 @@ def run_chat_loop(model, model_filename):
             console.print("\n[bold green]AI Response:[/bold green]", end=" ")
             full_response = ""
 
-            # Real-Time Token Generation via Streaming
             try:
+                if model is None:
+                    raise Exception("Model instance is None.")
+                
                 stream = model(
                     formatted_prompt,
                     stream=True,
@@ -368,25 +362,29 @@ def run_chat_loop(model, model_filename):
                     print(token, end="", flush=True)
                 print()
 
-            except Exception:
-                raw_response = model(
-                    formatted_prompt,
-                    max_new_tokens=512,
-                    temperature=0.7,
-                    top_p=0.9,
-                    stop=["<|im_end|>"]
-                )
-                full_response = raw_response.strip()
-                console.print(Markdown(full_response))
+            except Exception as stream_err:
+                try:
+                    raw_response = model(
+                        formatted_prompt,
+                        max_new_tokens=512,
+                        temperature=0.7,
+                        top_p=0.9,
+                        stop=["<|im_end|>"]
+                    )
+                    full_response = raw_response.strip()
+                    console.print(Markdown(full_response))
+                except Exception as fallback_err:
+                    console.print(f"\n[bold red]⚠️ Generation Error:[/bold red] {fallback_err}")
+                    continue
 
-            # Save AI response into history
-            chat_history.append({"role": "assistant", "content": full_response.strip()})
+            if full_response.strip():
+                chat_history.append({"role": "assistant", "content": full_response.strip()})
 
         except KeyboardInterrupt:
             console.print("\n\n[bold red]Session Interrupted by User.[/bold red]")
             break
         except Exception as error:
-            console.print(f"\n[bold red]⚠️ Generation Error:[/bold red] {error}")
+            console.print(f"\n[bold red]⚠️ Runtime Error:[/bold red] {error}")
 
 # ==========================================
 # 5. MAIN EXECUTION ENTRY POINT
@@ -399,3 +397,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+ 
