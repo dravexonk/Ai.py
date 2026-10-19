@@ -25,21 +25,26 @@ def run_cmd(command_list, suppress_output=False):
         stdout_target = subprocess.DEVNULL if suppress_output else None
         stderr_target = subprocess.DEVNULL if suppress_output else None
         return subprocess.run(command_list, check=True, stdout=stdout_target, stderr=stderr_target)
-    except Exception as e:
+    except Exception:
         return None
 
 def verify_and_fix_ctransformers():
     """
     Termux missing C++ shared binary error fix.
-    Force reinstalls ctransformers from source using Termux system compilers.
+    Force reinstalls ctransformers from source using Termux system compilers and setuptools.
     """
     print("\n[!] CTransformers native binaries missing for Android platform.")
     print("[!] Initiating automatic local source compilation (Termux C++ Auto-Fix)...")
-    print("[!] Installing native compilation toolchain (clang, cmake, ninja)...")
+    print("[!] Installing native compilation toolchain (clang, cmake, ninja, setuptools)...")
     
+    # 1. Install system compilers via Termux pkg (Removed python-dev as it does not exist)
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-dev", "-y"])
+        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-pip", "python-setuptools", "python-wheel", "-y"], suppress_output=False)
     
+    # Ensure setuptools and wheel are upgraded in pip
+    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
+
+    # 2. Reinstall ctransformers without binary isolation
     print("[!] Compiling ctransformers C++ engine locally for ARM64...")
     try:
         subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
@@ -53,12 +58,10 @@ def verify_and_fix_ctransformers():
         try:
             subprocess.check_call([
                 sys.executable, "-m", "pip", "install", 
-                "ctransformers", "--no-deps", "--force-reinstall"
+                "ctransformers", "--prefer-binary"
             ])
-        except Exception:
-            print("\n[❌] Critical: Manual fix needed. Please run:")
-            print("    pkg install clang cmake make -y")
-            print("    pip install ctransformers --no-build-isolation --no-binary ctransformers")
+        except Exception as e2:
+            print(f"\n[❌] Critical installation error: {e2}")
             sys.exit(1)
 
 def setup_environment():
@@ -70,14 +73,13 @@ def setup_environment():
     
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
         print("[+] Termux Environment Detected. Ensuring compiler binaries...")
-        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
+        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "python-setuptools", "python-wheel", "git", "binutils"]
         for pkg in system_packages:
-            try:
-                subprocess.run(["pkg", "install", pkg, "-y"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            except Exception:
-                pass
+            run_cmd(["pkg", "install", pkg, "-y"])
 
     required_pip_pkgs = [
+        "setuptools",
+        "wheel",
         "ctransformers",
         "rich",
         "requests",
