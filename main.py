@@ -5,9 +5,9 @@ Termux Universal Local AI Engine (Advanced Multi-Model Interactive System)
 Author: Modern AI Core
 Features:
  - Pure CPU Execution for Android / Termux (No PyTorch needed)
- - Self-Healing C++ Compilation Engine with scikit-build support
+ - Upgraded to Llama-Cpp-Python (Zero C++ compilation crash on Termux)
  - Interactive Hugging Face Downloader & Custom Repo Direct Fetching
- - Multi-Turn Conversation Memory Buffer & Safe NoneType Error Prevention
+ - Multi-Turn Conversation Memory Buffer & Safe Error Prevention
 """
 
 import os
@@ -28,39 +28,6 @@ def run_cmd(command_list, suppress_output=False):
     except Exception:
         return None
 
-def verify_and_fix_ctransformers():
-    """
-    Termux missing C++ shared binary & skbuild error fix.
-    Installs scikit-build, cmake, and reinstalls ctransformers.
-    """
-    print("\n[!] CTransformers native binaries or build modules missing.")
-    print("[!] Initiating automatic toolchain setup (scikit-build, cmake, clang)...")
-    
-    if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        run_cmd(["pkg", "install", "clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils", "-y"], suppress_output=False)
-    
-    # Ensure build prerequisites are present in Python
-    run_cmd([sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel", "scikit-build"])
-
-    print("[!] Compiling ctransformers C++ engine locally for ARM64...")
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "ctransformers", "-y"])
-        subprocess.check_call([
-            sys.executable, "-m", "pip", "install", 
-            "ctransformers", "--no-build-isolation", "--no-binary", "ctransformers"
-        ])
-        print("\n[✔] CTransformers C++ core compiled successfully!\n")
-    except Exception as err:
-        print(f"\n[❌] Source compilation failed: {err}")
-        try:
-            subprocess.check_call([
-                sys.executable, "-m", "pip", "install", 
-                "ctransformers", "--prefer-binary"
-            ])
-        except Exception as e2:
-            print(f"\n[❌] Critical installation error: {e2}")
-            sys.exit(1)
-
 def setup_environment():
     """
     Checks and automatically installs system packages and PIP libraries.
@@ -68,16 +35,16 @@ def setup_environment():
     print("\n[+] Checking System Environment for Termux & Linux...")
     
     if os.path.exists("/data/data/com.termux/files/usr/bin/pkg"):
-        print("[+] Termux Environment Detected. Ensuring compiler binaries...")
-        system_packages = ["clang", "cmake", "make", "ninja", "python", "python-pip", "git", "binutils"]
+        print("[+] Termux Environment Detected. Ensuring packages...")
+        system_packages = ["python", "python-pip", "git", "binutils"]
         for pkg in system_packages:
             run_cmd(["pkg", "install", pkg, "-y"])
 
+    # Python pip packages required (Using llama-cpp-python instead of ctransformers to fix build errors)
     required_pip_pkgs = [
         "setuptools",
         "wheel",
-        "scikit-build",
-        "ctransformers",
+        "llama-cpp-python",
         "rich",
         "requests",
         "tqdm",
@@ -85,7 +52,7 @@ def setup_environment():
     ]
 
     missing = False
-    for mod in ["ctransformers", "rich", "requests", "tqdm", "huggingface_hub", "skbuild"]:
+    for mod in ["llama_cpp", "rich", "requests", "tqdm", "huggingface_hub"]:
         if importlib.util.find_spec(mod) is None:
             missing = True
             break
@@ -93,15 +60,12 @@ def setup_environment():
     if missing:
         print("[!] Missing Python libraries detected. Installing...")
         try:
-            cmd = [sys.executable, "-m", "pip", "install", "--no-build-isolation"] + required_pip_pkgs
+            cmd = [sys.executable, "-m", "pip", "install", "--prefer-binary"] + required_pip_pkgs
             subprocess.check_call(cmd)
             print("\n[✔] Libraries installed successfully!\n")
-        except Exception:
-            try:
-                cmd_fallback = [sys.executable, "-m", "pip", "install", "--prefer-binary"] + required_pip_pkgs
-                subprocess.check_call(cmd_fallback)
-            except Exception as e:
-                print(f"\n[⚠️] Dependency installation warning: {e}")
+        except Exception as err:
+            print(f"\n[❌] Dependency installation error: {err}")
+            sys.exit(1)
 
 setup_environment()
 
@@ -111,6 +75,7 @@ from rich.prompt import Prompt
 from rich.markdown import Markdown
 from rich.table import Table
 from huggingface_hub import hf_hub_download
+from llama_cpp import Llama
 
 console = Console()
 
@@ -126,35 +91,31 @@ PREDEFINED_MODELS = {
         "title": "Qwen 2.5 0.5B Instruct (Ultra Fast / Recommended for Termux)",
         "repo_id": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         "filename": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "model_type": "qwen2",
         "size": "~350 MB"
     },
     "2": {
         "title": "TinyLlama 1.1B Chat (Lightweight & Smart)",
         "repo_id": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
         "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "model_type": "llama",
         "size": "~630 MB"
     },
     "3": {
         "title": "Qwen 2.5 1.5B Instruct (High Accuracy / Multi-Lingual)",
         "repo_id": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
         "filename": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "model_type": "qwen2",
         "size": "~1.1 GB"
     },
     "4": {
         "title": "Llama 3.2 1B Instruct (Meta's Small LLM)",
         "repo_id": "bartowski/Llama-3.2-1B-Instruct-GGUF",
         "filename": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        "model_type": "llama",
         "size": "~800 MB"
     }
 }
 
 SYSTEM_INSTRUCTION = (
-    "You are an intelligent, helpful, and polite AI assistant. "
-    "Respond accurately and clearly according to user preference in English or Hinglish."
+    "आप एक समझदार, उपयोगी और कुशल AI सहायक हैं। "
+    "यूज़र के हर सवाल का उत्तर स्पष्ट, सटीक और केवल शुद्ध हिंदी भाषा में दें।"
 )
 
 # ==========================================
@@ -165,7 +126,7 @@ def display_header():
     console.clear()
     banner = (
         "[bold magenta]🤖 TERMUX LOCAL AI ENGINE (OFFLINE CORE) 🤖[/bold magenta]\n\n"
-        "[green]✔ Zero PyTorch / CPU-Only Native C++ Execution[/green]\n"
+        "[green]✔ Zero PyTorch / CPU-Only Llama-Cpp Engine[/green]\n"
         "[green]✔ Interactive HuggingFace Downloader Built-In[/green]\n"
         "[green]✔ Multi-Turn Chat Memory & Streaming Tokens[/green]"
     )
@@ -232,20 +193,19 @@ def model_selection_menu():
         console.print("\n[bold cyan]--- Custom HuggingFace GGUF Setup ---[/bold cyan]")
         repo_id = Prompt.ask("Enter HuggingFace Repo ID (e.g. Qwen/Qwen2.5-0.5B-Instruct-GGUF)")
         filename = Prompt.ask("Enter exact GGUF File Name (e.g. qwen2.5-0.5b-instruct-q4_k_m.gguf)")
-        model_type = Prompt.ask("Enter Model Architecture Type (llama / qwen2 / mistral)", default="llama")
         
         file_path = download_hf_model(repo_id.strip(), filename.strip())
-        return file_path, model_type.strip(), filename.strip()
+        return file_path, filename.strip()
     else:
         selected = PREDEFINED_MODELS[choice]
         file_path = download_hf_model(selected["repo_id"], selected["filename"])
-        return file_path, selected["model_type"], selected["filename"]
+        return file_path, selected["filename"]
 
 # ==========================================
 # 4. INFERENCE ENGINE & LOAD MANAGEMENT
 # ==========================================
 
-def initialize_model(model_path, model_type):
+def initialize_model(model_path):
     console.print(
         Panel.fit(
             f"[bold cyan]⏳ Loading GGUF Model into RAM...[/bold cyan]\n"
@@ -256,30 +216,18 @@ def initialize_model(model_path, model_type):
         )
     )
 
-    for attempt in range(2):
-        try:
-            from ctransformers import AutoModelForCausalLM
-            model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                model_type=model_type,
-                gpu_layers=0,
-                context_length=2048
-            )
-            if model is None:
-                raise Exception("Model returned None object.")
-            return model
-        except Exception as error:
-            error_msg = str(error)
-            if attempt == 0:
-                console.print(f"\n[bold yellow]⚠️ Binary/Load Warning Detected:[/bold yellow] {error_msg}")
-                verify_and_fix_ctransformers()
-            else:
-                console.print(f"\n[bold red]❌ Failed to initialize CTransformers Model:[/bold red] {error_msg}")
-                console.print("[yellow]Tip: Model file corrupt ho sakti hai. 'downloaded_models/' se file delete karke dobara run karein.[/yellow]")
-                sys.exit(1)
-                
-    console.print(f"\n[bold red]❌ Critical Error: Model could not be initialized.[/bold red]")
-    sys.exit(1)
+    try:
+        # Llama-cpp-python initialization optimized for mobile CPU
+        model = Llama(
+            model_path=model_path,
+            n_ctx=2048,
+            n_threads=4,
+            verbose=False
+        )
+        return model
+    except Exception as error:
+        console.print(f"\n[bold red]❌ Failed to initialize Llama Model:[/bold red] {error}")
+        sys.exit(1)
 
 def run_chat_loop(model, model_filename):
     console.clear()
@@ -333,47 +281,34 @@ def run_chat_loop(model, model_filename):
 
             chat_history.append({"role": "user", "content": cleaned_input})
 
-            formatted_prompt = f"<|im_start|>system\n{SYSTEM_INSTRUCTION}<|im_end|>\n"
+            # Construct messages for Llama chat completion
+            messages = [{"role": "system", "content": SYSTEM_INSTRUCTION}]
             for msg in chat_history:
-                role = msg["role"]
-                content = msg["content"]
-                formatted_prompt += f"<|im_start|>{role}\n{content}<|im_end|>\n"
-            formatted_prompt += "<|im_start|>assistant\n"
+                messages.append({"role": msg["role"], "content": msg["content"]})
 
             console.print("\n[bold green]AI Response:[/bold green]", end=" ")
             full_response = ""
 
             try:
-                if model is None:
-                    raise Exception("Model instance is None.")
-                
-                stream = model(
-                    formatted_prompt,
-                    stream=True,
-                    max_new_tokens=512,
+                # Real-Time Token Generation via Streaming using llama-cpp-python
+                stream = model.create_chat_completion(
+                    messages=messages,
+                    max_tokens=512,
                     temperature=0.7,
-                    top_p=0.9,
-                    stop=["<|im_end|>"]
+                    stream=True
                 )
-                for token in stream:
-                    full_response += token
-                    print(token, end="", flush=True)
+                
+                for chunk in stream:
+                    delta = chunk["choices"][0]["delta"]
+                    if "content" in delta:
+                        token = delta["content"]
+                        full_response += token
+                        print(token, end="", flush=True)
                 print()
 
             except Exception as stream_err:
-                try:
-                    raw_response = model(
-                        formatted_prompt,
-                        max_new_tokens=512,
-                        temperature=0.7,
-                        top_p=0.9,
-                        stop=["<|im_end|>"]
-                    )
-                    full_response = raw_response.strip()
-                    console.print(Markdown(full_response))
-                except Exception as fallback_err:
-                    console.print(f"\n[bold red]⚠️ Generation Error:[/bold red] {fallback_err}")
-                    continue
+                console.print(f"\n[bold red]⚠️ Generation Error:[/bold red] {stream_err}")
+                continue
 
             if full_response.strip():
                 chat_history.append({"role": "assistant", "content": full_response.strip()})
@@ -389,10 +324,9 @@ def run_chat_loop(model, model_filename):
 # ==========================================
 
 def main():
-    model_path, model_type, model_filename = model_selection_menu()
-    loaded_model = initialize_model(model_path, model_type)
+    model_path, model_filename = model_selection_menu()
+    loaded_model = initialize_model(model_path)
     run_chat_loop(loaded_model, model_filename)
 
 if __name__ == "__main__":
     main()
-         
