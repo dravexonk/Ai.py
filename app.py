@@ -1,12 +1,11 @@
 #!/usr/bin/env python3
 """
 Termux Universal AI
-- Self-bootstrapping script
-- TUI-style menu inspired by the reference image
-- Direct Hugging Face GGUF download with progress bar
-- CLI chat mode and local Web UI mode
-- Works in Android Termux
-- Avoids huggingface_hub dependency because it breaks on many Termux builds
+- Fully self-bootstrapping
+- Direct GGUF download from Hugging Face with progress
+- Terminal UI matching the provided style
+- Real local CPU inference via llama-cpp-python if available
+- Fallback mode if llama-cpp isn't buildable on the current device
 """
 
 import os
@@ -19,9 +18,9 @@ import traceback
 import subprocess
 from pathlib import Path
 
-# -----------------------------------------------------
-# Required packages
-# -----------------------------------------------------
+# ---------------------------
+# Start with essential packages
+# ---------------------------
 try:
     import requests
 except Exception:
@@ -34,9 +33,7 @@ except Exception:
     subprocess.check_call([sys.executable, "-m", "pip", "install", "flask"])
     import flask
 
-# -----------------------------------------------------
-# Console style
-# -----------------------------------------------------
+
 RESET = "\033[0m"
 BOLD = "\033[1m"
 DIM = "\033[2m"
@@ -63,17 +60,105 @@ def center_text(text, width=100):
     right = width - len(text) - left
     return " " * left + text + " " * right
 
-def print_boxed_header():
+def safe_input(prompt):
+    try:
+        return input(prompt)
+    except EOFError:
+        print()
+        return "quit"
+
+# ---------------------------
+# Termux build tools
+# ---------------------------
+def which(cmd):
+    return shutil.which(cmd)
+
+def install_termux_build_tools():
+    print(color("[bootstrap] Checking build tools for llama-cpp-python...", FG["yellow"]))
+
+    # Try pkg install first (Termux)
+    commands = [
+        ["pkg", "install", "-y", "clang", "cmake", "make", "ninja"],
+        ["apt", "install", "-y", "clang", "cmake", "make", "ninja"],
+    ]
+
+    for cmd in commands:
+        if which(cmd[0]):
+            try:
+                print(color(f"[bootstrap] Running: {' '.join(cmd)}", FG["cyan"]))
+                subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return True
+            except Exception:
+                pass
+    return False
+
+# ---------------------------
+# llama-cpp-python installer
+# ---------------------------
+def ensure_llama_cpp():
+    try:
+        import llama_cpp
+        print(color("[bootstrap] llama-cpp-python already installed.", FG["green"]))
+        return True
+    except Exception:
+        print(color("[bootstrap] llama-cpp-python not found. Attempting install...", FG["yellow"]))
+
+        install_termux_build_tools()
+
+        env = os.environ.copy()
+        env["CMAKE_ARGS"] = (
+            "-DGGML_NATIVE=OFF "
+            "-DGGML_AVX=OFF "
+            "-DGGML_AVX2=OFF "
+            "-DGGML_FMA=OFF "
+            "-DGGML_CUDA=OFF "
+            "-DGGML_METAL=OFF "
+            "-DGGML_BLAS=OFF"
+        )
+        env["FORCE_CMAKE"] = "1"
+        env["PIP_NO_CACHE_DIR"] = "1"
+
+        candidate_packages = [
+            "llama-cpp-python",
+            "llama-cpp-python==0.3.7",
+            "llama-cpp-python==0.3.6",
+        ]
+
+        for pkg in candidate_packages:
+            try:
+                print(color(f"[bootstrap] Installing {pkg}", FG["cyan"]))
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                subprocess.check_call(
+                    [sys.executable, "-m", "pip", "install", "--no-cache-dir", "--force-reinstall", pkg],
+                    env=env,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                )
+                import llama_cpp
+                print(color("[bootstrap] llama-cpp-python installed successfully.", FG["green"]))
+                return True
+            except Exception as e:
+                print(color(f"[bootstrap] Failed for {pkg}: {e}", FG["yellow"]))
+
+        print(color("[warning] Could not install llama-cpp-python on this Termux build.", FG["red"]))
+        return False
+
+# ---------------------------
+# UI / terminal style
+# ---------------------------
+def print_header():
     width = shutil.get_terminal_size((110, 30)).columns
     w = max(85, min(width, 110))
     line = "═" * w
-    title = "GitHub Hub: Termux Universal AI"
-    subtitle = "Android • Termux • Local CPU • GGUF • Web UI Ready"
-
     print()
     print(color(line, FG["blue"]))
-    print(color(center_text(title, w), FG["magenta"] + BOLD))
-    print(color(center_text(subtitle, w), FG["cyan"]))
+    print(color(center_text("GitHub Hub: Termux Universal AI", w), FG["magenta"] + BOLD))
+    print(color(center_text("Android • Termux • Local CPU • GGUF • Browser Ready", w), FG["cyan"]))
     print(color(line, FG["blue"]))
     print()
 
@@ -85,75 +170,19 @@ def print_status_flags():
         ("[OK]", "CPU Mode Ready", FG["green"]),
         ("[OK]", "GGUF Download Ready", FG["green"]),
     ]
-
     for tag, name, c in flags:
         print(f"  {color(tag, c)}  {color(name, FG['white'])}")
 
-def safe_input(prompt):
-    try:
-        return input(prompt)
-    except EOFError:
-        print()
-        return "quit"
-
-# -----------------------------------------------------
-# Model catalog
-# -----------------------------------------------------
+# ---------------------------
+# Model list
+# ---------------------------
 MODEL_PRESETS = [
-    {
-        "id": 1,
-        "name": "Qwen 2.5 0.5B",
-        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
-        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
-        "desc": "Fast CPU chat"
-    },
-    {
-        "id": 2,
-        "name": "TinyLlama 1.1B",
-        "repo": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        "file": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "desc": "Very light"
-    },
-    {
-        "id": 3,
-        "name": "Qwen 2.5 1.5B",
-        "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-        "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
-        "desc": "Balanced size"
-    },
-    {
-        "id": 4,
-        "name": "Llama 3.2 1B",
-        "repo": "unsloth/Llama-3.2-1B-Instruct-GGUF",
-        "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
-        "desc": "General assistant"
-    },
-    {
-        "id": 5,
-        "name": "Custom GGUF",
-        "repo": "",
-        "file": "",
-        "desc": "Manual repo + file"
-    },
+    {"id": 1, "name": "Qwen 2.5 0.5B", "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF", "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf", "desc": "Fast CPU chat"},
+    {"id": 2, "name": "TinyLlama 1.1B", "repo": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF", "file": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf", "desc": "Very light"},
+    {"id": 3, "name": "Qwen 2.5 1.5B", "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF", "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf", "desc": "Balanced size"},
+    {"id": 4, "name": "Llama 3.2 1B", "repo": "unsloth/Llama-3.2-1B-Instruct-GGUF", "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf", "desc": "General assistant"},
+    {"id": 5, "name": "Custom GGUF", "repo": "", "file": "", "desc": "Manual repo + file"},
 ]
-
-def model_dir() -> Path:
-    d = Path.home() / ".termux_universal_ai" / "models"
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def human_readable_size(num_bytes):
-    if num_bytes <= 0:
-        return "0 B"
-    units = ["B", "KB", "MB", "GB", "TB"]
-    size = float(num_bytes)
-    idx = 0
-    while size >= 1024 and idx < len(units) - 1:
-        size /= 1024
-        idx += 1
-    if idx == 0:
-        return f"{int(size)} {units[idx]}"
-    return f"{size:.1f} {units[idx]}"
 
 def render_model_menu():
     print(color("Model Selection", FG["yellow"] + BOLD))
@@ -171,19 +200,16 @@ def prompt_model_choice():
         if not choice:
             print(color("Please choose a valid model number.", FG["red"]))
             continue
-
         try:
             idx = int(choice)
         except ValueError:
             print(color("Use digits only, like 1, 2, 3, 4, 5.", FG["red"]))
             continue
-
         if idx < 1 or idx > len(MODEL_PRESETS):
             print(color("Selection out of range. Try again.", FG["red"]))
             continue
 
         m = MODEL_PRESETS[idx - 1]
-
         if m["id"] == 5:
             repo = safe_input(color("Custom Hugging Face repo ID: ", FG["cyan"])).strip()
             filename = safe_input(color("GGUF filename: ", FG["cyan"])).strip()
@@ -194,12 +220,31 @@ def prompt_model_choice():
 
         return m["repo"], m["file"], m["name"]
 
-# -----------------------------------------------------
-# Direct HF downloader (no huggingface_hub)
-# -----------------------------------------------------
+# ---------------------------
+# Models folder
+# ---------------------------
+def model_dir():
+    d = Path.home() / ".termux_universal_ai" / "models"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def human_readable_size(num_bytes):
+    if num_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num_bytes)
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.1f} {units[idx]}"
+
+# ---------------------------
+# Direct GGUF download
+# ---------------------------
 def hf_download_url(repo, filename, branch="main"):
-    # Example:
-    # https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
     return f"https://huggingface.co/{repo}/resolve/{branch}/{filename}"
 
 def download_model(repo, filename, label):
@@ -254,13 +299,13 @@ def download_model(repo, filename, label):
 
     raise RuntimeError(f"Could not download {repo}/{filename} from Hugging Face.")
 
-# -----------------------------------------------------
-# Local inference backend
-# -----------------------------------------------------
+# ---------------------------
+# Real local inference
+# ---------------------------
 def cpu_thread_count():
     return max(1, min(8, (os.cpu_count() or 4)))
 
-def load_model_backend(model_path):
+def load_llama_backend(model_path):
     try:
         import llama_cpp
         print(color("[model] Loading llama-cpp model...", FG["yellow"]))
@@ -273,8 +318,7 @@ def load_model_backend(model_path):
         )
         return llm, "llama_cpp"
     except Exception as e:
-        print(color(f"[model] llama-cpp-python not available: {e}", FG["yellow"]))
-        print(color("[model] Falling back to safe local response mode.", FG["yellow"]))
+        print(color(f"[model] llama-cpp backend unavailable: {e}", FG["yellow"]))
         return None, "fallback"
 
 def generate_llama_text(llm, prompt, max_tokens=180):
@@ -290,32 +334,32 @@ def generate_llama_text(llm, prompt, max_tokens=180):
         text = result.get("choices", [{}])[0].get("text", "")
         return (text or "").strip()
     except Exception as e:
-        print(color(f"[error] Model generation failed: {e}", FG["red"]))
+        print(color(f"[error] Generation failed: {e}", FG["red"]))
         return ""
 
 def fallback_reply(prompt):
     p = prompt.lower()
-    if "hello" in p or "hi" in p:
-        return "Hello! I am the Termux Universal AI in fallback mode. A proper GGUF runtime is available when llama-cpp is installed."
+    if "hello" in p or "hi" in p or "namaste" in p:
+        return "Hello! I am the Termux Universal AI. The real GGUF model runtime is available when llama-cpp-python is successfully installed."
     if "your name" in p or "who are you" in p:
-        return "I am Termux Universal AI, a local Android AI assistant running in your Termux terminal."
+        return "I am Termux Universal AI, a local Android AI assistant inside Termux."
     if "bye" in p or "exit" in p:
-        return "Goodbye! Use the terminal menu again whenever you want."
+        return "Goodbye! Use the menu again whenever you want to continue."
     return (
-        "I am running in safe fallback mode because llama-cpp is not installed on this device yet. "
-        "The model download already completed, and once the native runtime is available, this app will use real local inference."
+        "This is fallback mode. The app successfully downloaded the model, but llama-cpp-python is not yet built on this device. "
+        "Please rerun the app after installing the native backend."
     )
 
-# -----------------------------------------------------
+# ---------------------------
 # CLI mode
-# -----------------------------------------------------
+# ---------------------------
 def cli_chat(model_path):
-    llm, backend = load_model_backend(model_path)
+    llm, backend = load_llama_backend(model_path)
 
     print()
     print(color("Termux CLI Chat Mode", FG["magenta"] + BOLD))
     print(color("Type 'quit' or 'exit' to leave.", FG["gray"]))
-    print(color("This chat runs fully on local CPU when supported.", FG["cyan"]))
+    print(color("This chat runs locally on CPU when supported.", FG["cyan"]))
     print("-" * 95)
 
     while True:
@@ -338,17 +382,17 @@ def cli_chat(model_path):
             print(color("\nAI> ", FG["blue"] + BOLD), end="", flush=True)
             print(fallback_reply(user_text))
 
-# -----------------------------------------------------
+# ---------------------------
 # Web UI mode
-# -----------------------------------------------------
+# ---------------------------
 def start_web_ui(model_path):
     try:
         from flask import Flask, request, jsonify, render_template_string
     except Exception:
-        print(color("[fatal] Flask is not installed. The app should install it automatically on first run.", FG["red"]))
+        print(color("[fatal] Flask is not installed. The script should auto-install it.", FG["red"]))
         return
 
-    llm, backend = load_model_backend(model_path)
+    llm, backend = load_llama_backend(model_path)
 
     app = Flask(__name__)
 
@@ -419,7 +463,7 @@ def start_web_ui(model_path):
             <div class="wrap">
                 <h1>GitHub Hub: Termux Universal AI</h1>
                 <div class="small">Local CPU • Browser UI • Android Termux</div>
-                <textarea id="prompt">Hello, tell me about the local AI assistant.</textarea>
+                <textarea id="prompt">Hello, tell me about this local AI assistant.</textarea>
                 <button onclick="ask()">Generate</button>
                 <div class="result" id="result">Waiting for input...</div>
             </div>
@@ -473,16 +517,19 @@ def start_web_ui(model_path):
     host = "0.0.0.0"
     port = 7860
     print(color(f"[webui] Starting local browser server at http://127.0.0.1:{port}", FG["green"]))
-    print(color(f"[webui] Open the browser on the same device to access the chat UI.", FG["cyan"]))
+    print(color(f"[webui] Open the same device browser to access it.", FG["cyan"]))
     app.run(host=host, port=port, debug=False, use_reloader=False)
 
-# -----------------------------------------------------
-# Main flow
-# -----------------------------------------------------
+# ---------------------------
+# Main
+# ---------------------------
 def main():
-    # startup
-    print_boxed_header()
+    print_header()
     print_status_flags()
+    print()
+
+    print(color("[bootstrap] Verifying backend support...", FG["yellow"]))
+    ensure_llama_cpp()
     print()
 
     repo, filename, model_label = prompt_model_choice()
@@ -490,7 +537,7 @@ def main():
         model_path = download_model(repo, filename, model_label)
     except Exception as e:
         print(color(f"[fatal] Model download failed: {e}", FG["red"]))
-        print(color("Check internet, repo name, and GGUF filename.", FG["yellow"]))
+        print(color("Check internet, repo name, and file name.", FG["yellow"]))
         return
 
     while True:
