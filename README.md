@@ -54,8 +54,10 @@ If `pkg install` fails for some package, you can try:
 apt update && apt upgrade -y
 apt install -y git python clang cmake make ninja
 ```
-
----
+## clone tools command 
+```
+https://github.com/dravexonk/Ai.py.git
+```
 
 ## Installation
 
