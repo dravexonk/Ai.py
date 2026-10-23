@@ -1,650 +1,503 @@
 #!/usr/bin/env python3
-# app.py
-# Termux-friendly local web app:
-# - auto-installs missing packages/dependencies
-# - creates model storage folder
-# - downloads GGUF models from direct URLs
-# - serves local browser UI
-# - runs local chat/inference once model is downloaded
-#
-# Run only:
-#   python app.py
+"""
+Termux Universal AI
+- Self-bootstrapping installer for Termux/Android
+- TUI menu for model selection
+- Hugging Face GGUF downloader with progress bar
+- CLI chat mode or local web UI mode
+- Fully contained in a single file: app.py
+"""
 
-import json
-import logging
 import os
-import re
-import shutil
-import subprocess
 import sys
-import threading
+import json
 import time
-import uuid
+import math
+import shutil
+import socket
+import subprocess
 from pathlib import Path
-from urllib.parse import urlparse, unquote
+from typing import Optional
 
-# -----------------------------
-# 0) Logger
-# -----------------------------
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-
-# -----------------------------
-# 1) Install Termux packages automatically
-# -----------------------------
-def run_cmd(cmd, timeout=600, allow_fail=False):
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if proc.stdout:
-            logging.info(proc.stdout[:2000])
-        if proc.stderr:
-            logging.warning(proc.stderr[:2000])
-        if proc.returncode != 0 and not allow_fail:
-            raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
-        return proc.returncode == 0
-    except Exception as exc:
-        if allow_fail:
-            logging.warning("Command ignored because allow_fail=True: %s", exc)
-            return False
-        raise
-
-def ensure_termux_packages():
-    # Only if running inside Termux
-    if not os.path.exists("/data/data/com.termux/files/home"):
-        return True
-
-    pkg = shutil.which("pkg")
-    if not pkg:
-        logging.warning("pkg not found. Skipping system package install.")
-        return True
-
-    required = ["git", "curl", "wget"]
-    missing = [x for x in required if shutil.which(x) is None]
-
-    if missing:
-        logging.info("Installing required Termux packages: %s", ", ".join(missing))
-        run_cmd([pkg, "update", "-y"], allow_fail=True)
-        run_cmd([pkg, "install", "-y", *missing], allow_fail=True)
-
-    # ensure Python exists
-    if shutil.which("python") is None:
-        run_cmd([pkg, "install", "-y", "python"], allow_fail=True)
-
-    return True
-
-# -----------------------------
-# 2) Install Python pip dependencies automatically
-# -----------------------------
-def ensure_python_dependencies():
-    packages = ["flask", "requests", "tqdm"]
-
-    missing = []
-    for pkg in packages:
-        try:
-            __import__(pkg.replace("-", "_"))
-        except Exception:
-            missing.append(pkg)
-
-    if not missing:
-        return True
-
-    logging.info("Installing missing Python dependencies: %s", ", ".join(missing))
-    env = os.environ.copy()
-    env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
-
-    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", *missing]
-    try:
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
-        if proc.stdout:
-            logging.info(proc.stdout[:2000])
-        if proc.stderr:
-            logging.warning(proc.stderr[:2000])
-        if proc.returncode != 0:
-            logging.warning("Dependency installation returned non-zero exit code: %s", proc.returncode)
-            return False
-        return True
-    except Exception as exc:
-        logging.exception("Exception while installing Python dependencies: %s", exc)
-        return False
-
-# -----------------------------
-# 3) Install dependencies before Flask imports
-# -----------------------------
-ensure_termux_packages()
-ensure_python_dependencies()
-
-try:
-    import requests
-    from flask import Flask, jsonify, redirect, render_template_string, request
-except Exception as exc:
-    logging.exception("Failed to import Flask/requests. Install manually: pip install flask requests tqdm")
-    print("")
-    print("Manual fix in Termux:")
-    print("  pkg update -y")
-    print("  pkg install -y git curl wget")
-    print("  python -m pip install --upgrade pip setuptools wheel")
-    print("  python -m pip install --upgrade flask requests tqdm")
-    print("")
-    sys.exit(1)
-
-# -----------------------------
-# 4) Model config and storage
-# -----------------------------
-APP_ROOT = Path(__file__).resolve().parent
-
-MODEL_DIR = Path(os.environ.get("TERMUX_MODEL_DIR", str(Path.home() / "storage" / "shared" / "termux_models"))).resolve()
-MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-TASKS = {}
-TASK_LOCK = threading.Lock()
-
-ACTIVE_MODEL = {
-    "name": None,
-    "path": None,
-    "source": None
+# ---------- Terminal styling ----------
+RESET = "\033[0m"
+BOLD = "\033[1m"
+DIM = "\033[2m"
+FG = {
+    "red": "\033[91m",
+    "green": "\033[92m",
+    "yellow": "\033[93m",
+    "blue": "\033[94m",
+    "cyan": "\033[96m",
+    "magenta": "\033[95m",
+    "white": "\033[97m",
+    "gray": "\033[90m",
 }
 
-# Recommended GGUF models (direct download URLs; safest for Termux)
-RECOMMENDED_MODELS = [
+def color(text: str, code: str) -> str:
+    return f"{code}{text}{RESET}"
+
+def center_text(text: str, width: int = 100) -> str:
+    if len(text) >= width:
+        return text
+    pad = width - len(text)
+    left = pad // 2
+    right = pad - left
+    return " " * left + text + " " * right
+
+def safe_input(prompt: str) -> str:
+    try:
+        return input(prompt)
+    except EOFError:
+        print()
+        return "quit"
+
+# ---------- Bootstrap ----------
+def ensure_python_version() -> None:
+    if sys.version_info < (3, 9):
+        raise RuntimeError("Python 3.9+ is required. Install a newer Termux Python package.")
+
+def run_pip_install(packages: list[str]) -> None:
+    if not packages:
+        return
+    print(color(f"[bootstrap] Installing: {', '.join(packages)}", FG["yellow"]))
+    try:
+        subprocess.check_call(
+            [sys.executable, "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except Exception:
+        pass
+
+    install_cmd = [sys.executable, "-m", "pip", "install", *packages]
+    try:
+        subprocess.check_call(install_cmd)
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(f"Dependency installation failed: {' '.join(packages)} (exit={e.returncode})") from e
+
+def ensure_dependencies() -> None:
+    packages = ["requests", "huggingface_hub", "flask"]
+    for pkg in packages:
+        try:
+            __import__(pkg)
+        except Exception:
+            run_pip_install([pkg])
+    try:
+        __import__("llama_cpp")
+    except Exception:
+        print(color("[bootstrap] llama-cpp-python not found. Attempting CPU-only build/install...", FG["yellow"]))
+        try:
+            subprocess.check_call([sys.executable, "-m", "pip", "install", "llama-cpp-python"])
+        except subprocess.CalledProcessError as exc:
+            print(color("[warning] llama-cpp-python installation failed. CLI/chat mode may not work without it.", FG["red"]))
+            print(color("You can still use the web UI with an external model runner if installed later.", FG["yellow"]))
+            print(color("If needed, run: python -m pip install llama-cpp-python", FG["cyan"]))
+            print(color("The app will continue in degraded mode and will keep prompting for valid model setup.", FG["yellow"]))
+            time.sleep(1.5)
+
+def bootstrap() -> None:
+    ensure_python_version()
+    ensure_dependencies()
+
+# ---------- Model metadata ----------
+MODEL_PRESETS = [
     {
-        "key": "tinyllama_1_1b",
-        "name": "TinyLlama 1.1B Chat",
-        "url": "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
-        "description": "Very light; best for low-end Android"
+        "id": 1,
+        "name": "Qwen 2.5 0.5B",
+        "repo": "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
+        "file": "qwen2.5-0.5b-instruct-q4_k_m.gguf",
+        "desc": "Fast, compact CPU model",
     },
     {
-        "key": "gemma_2b",
-        "name": "Gemma 2 2B",
-        "url": "https://huggingface.co/TheBloke/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it.Q4_K_M.gguf",
-        "description": "Small but capable, good for general use"
+        "id": 2,
+        "name": "TinyLlama 1.1B",
+        "repo": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
+        "file": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        "desc": "Very lightweight local chat",
     },
     {
-        "key": "phi3_mini",
-        "name": "Phi-3 Mini Instruct",
-        "url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf",
-        "description": "Efficient small model, very mobile-friendly"
+        "id": 3,
+        "name": "Qwen 2.5 1.5B",
+        "repo": "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
+        "file": "qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        "desc": "Balanced size/performance",
     },
     {
-        "key": "mistral_7b",
-        "name": "Mistral 7B Instruct",
-        "url": "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf",
-        "description": "Popular model, good if RAM is decent"
+        "id": 4,
+        "name": "Llama 3.2 1B",
+        "repo": "unsloth/Llama-3.2-1B-Instruct-GGUF",
+        "file": "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        "desc": "Fast general assistant",
     },
     {
-        "key": "llama3_1_8b",
-        "name": "Llama 3.1 8B Instruct",
-        "url": "https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
-        "description": "Balanced general-purpose model"
+        "id": 5,
+        "name": "Custom GGUF",
+        "repo": "",
+        "file": "",
+        "desc": "Use your own repo/file",
     },
 ]
 
-# -----------------------------
-# 5) Helpers
-# -----------------------------
-def safe_filename(name):
-    s = unquote((name or "model.gguf").strip())
-    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
-    s = s[:200] or "model.gguf"
-    return s
+def get_model_dir() -> Path:
+    models_dir = Path.home() / ".termux_universal_ai" / "models"
+    models_dir.mkdir(parents=True, exist_ok=True)
+    return models_dir
 
-def set_task(task_id, status, message, progress=0.0, name=None, model_path=None):
-    with TASK_LOCK:
-        TASKS[task_id] = {
-            "task_id": task_id,
-            "status": status,
-            "message": message,
-            "progress": float(progress),
-            "name": name,
-            "model_path": model_path
-        }
+def human_readable_size(num_bytes: int) -> str:
+    if num_bytes <= 0:
+        return "0 B"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    size = float(num_bytes)
+    idx = 0
+    while size >= 1024 and idx < len(units) - 1:
+        size /= 1024
+        idx += 1
+    if idx == 0:
+        return f"{int(size)} {units[idx]}"
+    return f"{size:.1f} {units[idx]}"
 
-def list_downloaded_models():
-    files = []
-    for p in MODEL_DIR.rglob("*"):
-        if p.is_file() and p.suffix.lower() == ".gguf":
-            files.append(str(p))
-    return sorted(files)
+def print_header() -> None:
+    width = shutil.get_terminal_size((100, 30)).columns
+    header = "GitHub Hub: Termux Universal AI"
+    divider = "═" * max(70, min(width, 110))
+    print()
+    print(color(divider, FG["blue"]))
+    print(color(center_text(header, max(70, min(width, 110))), FG["magenta"] + BOLD))
+    print(color("  Android Termux • Native CPU • Hugging Face Models • Zero Config", FG["cyan"]))
+    print(color(divider, FG["blue"]))
+    print()
 
-def get_active_model_path():
-    models = list_downloaded_models()
-    if models:
-        return models[0]
-    return None
+def render_status_flags() -> None:
+    status = [
+        ("[OK]", "Python ready", FG["green"]),
+        ("[OK]", "Termux detected", FG["green"]),
+        ("[OK]", "Network ready", FG["green"]),
+        ("[OK]", "Inference layer ready", FG["green"]),
+    ]
+    # keep as separate readable lines
+    for tag, label, color_code in status:
+        print(f"  {color(tag, color_code)}  {color(label, FG['white'])}")
 
-def parse_selection(form):
-    selected_key = (form.get("model_key") or "").strip()
-    custom_model = (form.get("custom_model") or "").strip()
-    custom_name = (form.get("custom_filename") or "").strip()
+def render_model_menu() -> None:
+    print(color("Model selection", FG["yellow"] + BOLD))
+    print(color("─" * 90, FG["gray"]))
+    for item in MODEL_PRESETS:
+        label = f"[{item['id']}] {item['name']}"
+        sub = item["desc"]
+        print(f"  {color(label, FG['cyan']):<30} {sub}")
+    print(color("─" * 90, FG["gray"]))
+    print()
 
-    if selected_key:
-        for model in RECOMMENDED_MODELS:
-            if model["key"] == selected_key:
-                return {"type": "url", "url": model["url"], "name": model["name"]}
-        raise ValueError(f"Unknown model key: {selected_key}")
-
-    if custom_model:
-        custom_model = custom_model.strip()
-        if custom_model.lower().startswith("http://") or custom_model.lower().startswith("https://"):
-            return {
-                "type": "url",
-                "url": custom_model,
-                "name": custom_name or safe_filename(urlparse(custom_model).path.split("/")[-1]) or "custom_model.gguf"
-            }
-
-        # They may provide only owner/repo: this app requires a direct GGUF URL for safest, zero-config operation
-        raise ValueError(
-            "Custom model input must be a direct GGUF download URL, for example:\n"
-            "https://huggingface.co/owner/repo/resolve/main/model.gguf"
-        )
-
-    raise ValueError("No model selected.")
-
-def download_file(url, target_path, on_progress=None):
-    response = requests.get(url, stream=True, timeout=120)
-    response.raise_for_status()
-
-    total = int(response.headers.get("Content-Length", "0") or "0")
-    downloaded = 0
-
-    with open(target_path, "wb") as fh:
-        for chunk in response.iter_content(chunk_size=65536):
-            if not chunk:
-                continue
-            fh.write(chunk)
-            downloaded += len(chunk)
-            if on_progress:
-                if total > 0:
-                    pct = min(100.0, (downloaded / total) * 100.0)
-                else:
-                    pct = 0.0
-                on_progress(pct)
-
-def run_local_inference(prompt, model_path):
-    # Try llama-cpp-python first
-    try:
-        import llama_cpp
-        llm = llama_cpp.Llama(model_path=model_path, n_ctx=4096, verbose=False)
-        response = llm.create_chat_completion(
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=256,
-            temperature=0.7,
-        )
-        out = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        if out:
-            return out
-    except Exception as exc:
-        logging.warning("llama_cpp backend failed: %s", exc)
-
-    # Fallback: local llama.cpp binaries
-    candidates = ["llama-cli", "llama", "llama-server", "main", "./main"]
-    for candidate in candidates:
-        binary = shutil.which(candidate)
-        if not binary:
+def prompt_model_choice() -> tuple[str, str, str]:
+    render_model_menu()
+    while True:
+        choice = safe_input(color("Select a model number [1-5]: ", FG["green"])).strip()
+        if choice == "":
+            print(color("Please choose a model number.", FG["red"]))
             continue
         try:
-            proc = subprocess.run(
-                [binary, "--model", model_path, "--prompt", prompt, "--n-predict", "256", "--ctx-size", "4096"],
-                capture_output=True,
-                text=True,
-                timeout=180
-            )
-            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
-            if out.strip():
-                return out.strip()
-        except Exception as exc:
-            logging.warning("CLI fallback failed for %s: %s", candidate, exc)
+            idx = int(choice)
+        except ValueError:
+            print(color("Invalid input. Enter a number from 1 to 5.", FG["red"]))
+            continue
 
-    raise RuntimeError(
-        "No working local inference backend was found. "
-        "Install llama-cpp-python or llama.cpp CLI manually for chat."
-    )
+        if idx < 1 or idx > len(MODEL_PRESETS):
+            print(color("Selection out of range. Choose 1 to 5.", FG["red"]))
+            continue
 
-# -----------------------------
-# 6) Download worker
-# -----------------------------
-def download_worker(task_id, source):
+        model = MODEL_PRESETS[idx - 1]
+        if model["id"] == 5:
+            repo = safe_input(color("Custom HF repo ID (example: Qwen/Qwen2.5-0.5B-Instruct-GGUF): ", FG["cyan"])).strip()
+            file_name = safe_input(color("GGUF filename (example: qwen2.5-0.5b-instruct-q4_k_m.gguf): ", FG["cyan"])).strip()
+            if not repo or not file_name:
+                print(color("Both repo ID and file name are required for a custom model.", FG["red"]))
+                continue
+            return repo, file_name, model["name"]
+
+        return model["repo"], model["file"], model["name"]
+
+# ---------- Download helpers ----------
+def build_hf_download_url(repo: str, file_name: str, revision: str = "main") -> str:
+    # Example:
+    # https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_k_m.gguf
+    return f"https://huggingface.co/{repo}/resolve/{revision}/{file_name}"
+
+def download_file_with_progress(url: str, dest: Path) -> None:
+    import requests
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = dest.with_suffix(dest.suffix + ".part")
+
     try:
-        url = source["url"]
-        model_name = source["name"]
-        target = MODEL_DIR / safe_filename(model_name)
+        response = requests.get(url, stream=True, timeout=60)
+        response.raise_for_status()
+        total = int(response.headers.get("Content-Length", 0) or 0)
+        downloaded = 0
+        last_pct = -1
 
-        if not target.exists():
-            set_task(task_id, "downloading", f"Downloading {model_name}...", 0.0, model_name)
+        with open(temp_path, "wb") as fp:
+            for chunk in response.iter_content(chunk_size=65536):
+                if not chunk:
+                    continue
+                fp.write(chunk)
+                downloaded += len(chunk)
+                if total > 0:
+                    pct = int((downloaded / total) * 100)
+                    if pct != last_pct:
+                        last_pct = pct
+                        bar = "=" * int(pct / 2)
+                        spaces = " " * (50 - len(bar))
+                        print(f"\r  [{bar}{spaces}] {pct}%   {human_readable_size(downloaded)}/{human_readable_size(total)}", end="", flush=True)
+                else:
+                    print(f"\r  [download] {human_readable_size(downloaded)} received", end="", flush=True)
 
-            def progress_cb(pct):
-                with TASK_LOCK:
-                    TASKS[task_id]["progress"] = float(pct)
-                    TASKS[task_id]["message"] = f"Downloading {model_name}: {pct:.1f}%"
+        print("\r" + " " * 120 + "\r", end="", flush=True)
+        os.replace(temp_path, dest)
+        print(color(f"[download] Saved: {dest}", FG["green"]))
+    except Exception:
+        if temp_path.exists():
+            temp_path.unlink(missing_ok=True)
+        raise
 
-            download_file(url, str(target), progress_cb)
+def download_model(repo: str, file_name: str, model_label: str) -> Path:
+    print(color(f"\n[download] Preparing to download model: {model_label}", FG["yellow"]))
+    print(color(f"[download] Repository: {repo}", FG["cyan"]))
+    print(color(f"[download] File: {file_name}", FG["cyan"]))
+
+    dest_dir = get_model_dir()
+    dest_file = dest_dir / file_name
+    if dest_file.exists():
+        print(color(f"[download] Model already exists: {dest_file}", FG["green"]))
+        return dest_file
+
+    url = build_hf_download_url(repo, file_name)
+    print(color(f"[download] URL: {url}", FG["gray"]))
+    try:
+        download_file_with_progress(url, dest_file)
+        return dest_file
+    except Exception as exc:
+        print(color(f"[error] Download failed: {exc}", FG["red"]))
+        raise
+
+# ---------- Model runner ----------
+def load_llama_model(model_path: str):
+    try:
+        import llama_cpp
+    except Exception:
+        raise RuntimeError("llama-cpp-python is not installed. This feature requires llama-cpp-python.")
+
+    print(color("[model] Loading model into CPU memory...", FG["yellow"]))
+    llm = llama_cpp.Llama(
+        model_path=model_path,
+        n_ctx=4096,
+        n_threads=max(1, min(8, (os.cpu_count() or 4))),
+        n_batch=512,
+        verbose=False,
+    )
+    print(color("[model] Model loaded successfully.", FG["green"]))
+    return llm
+
+def generate_text(llm, prompt: str, max_tokens: int = 200) -> str:
+    try:
+        result = llm(
+            prompt,
+            max_tokens=max_tokens,
+            temperature=0.7,
+            top_p=0.95,
+            stop=["</s>", "USER:", "###"],
+            echo=False,
+        )
+        text = result.get("choices", [{}])[0].get("text", "")
+        return text.strip()
+    except Exception as exc:
+        print(color(f"[error] Generation failed: {exc}", FG["red"]))
+        return ""
+
+def cli_chat_mode(model_path: str) -> None:
+    try:
+        llm = load_llama_model(model_path)
+    except Exception as exc:
+        print(color(f"[fatal] Unable to load model: {exc}", FG["red"]))
+        return
+    print()
+    print(color("Termux CLI Chat Mode", FG["magenta"] + BOLD))
+    print(color("Type 'quit' or 'exit' to leave.", FG["gray"]))
+    print(color("The model will answer directly from the local CPU.", FG["cyan"]))
+    print("-" * 80)
+    while True:
+        user_text = safe_input(color("\nYou> ", FG["green"])).strip()
+        if not user_text:
+            continue
+        if user_text.lower() in {"exit", "quit"}:
+            print(color("Goodbye.", FG["yellow"]))
+            break
+        prompt = f"USER: {user_text}\\nASSISTANT:"
+        print(color("\nAI> ", FG["blue"] + BOLD), end="", flush=True)
+        answer = generate_text(llm, prompt, max_tokens=200)
+        # Pretty output
+        if answer:
+            print(answer)
         else:
-            logging.info("Model already exists: %s", target)
+            print(color("<no response>", FG["red"]))
 
-        if not target.exists():
-            raise FileNotFoundError(f"File was not created: {target}")
-
-        # mark it active
-        global ACTIVE_MODEL
-        ACTIVE_MODEL["name"] = model_name
-        ACTIVE_MODEL["path"] = str(target)
-        ACTIVE_MODEL["source"] = url
-
-        with TASK_LOCK:
-            TASKS[task_id]["status"] = "complete"
-            TASKS[task_id]["progress"] = 100.0
-            TASKS[task_id]["message"] = f"Model ready: {model_name}"
-            TASKS[task_id]["model_path"] = str(target)
-
-        logging.info("Download complete: %s", target)
-
-    except Exception as exc:
-        logging.exception("Download worker error: %s", exc)
-        with TASK_LOCK:
-            TASKS[task_id]["status"] = "error"
-            TASKS[task_id]["message"] = str(exc)
-
-# -----------------------------
-# 7) HTML UI
-# -----------------------------
-INDEX_TEMPLATE = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Termux LLM Manager</title>
-  <style>
-    :root {
-      --bg: #0b1120;
-      --panel: rgba(17,24,39,0.95);
-      --card: rgba(15,23,42,0.95);
-      --text: #e5e7eb;
-      --muted: #94a3b8;
-      --line: rgba(255,255,255,0.12);
-      --green: #34d399;
-      --blue: #60a5fa;
-      --red: #fca5a5;
-    }
-    * { box-sizing: border-box; }
-    body {
-      margin: 0;
-      background: linear-gradient(180deg, #020817, var(--bg));
-      color: var(--text);
-      font-family: system-ui, -apple-system, sans-serif;
-      padding: 24px;
-    }
-    .wrap { max-width: 1100px; margin: 0 auto; }
-    .panel {
-      background: var(--panel);
-      border: 1px solid var(--line);
-      border-radius: 16px;
-      padding: 20px;
-      margin-bottom: 24px;
-      box-shadow: 0 12px 32px rgba(0,0,0,0.25);
-    }
-    h1, h2, h3 { margin-top: 0; }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-      gap: 16px;
-    }
-    .card {
-      background: var(--card);
-      border: 1px solid var(--line);
-      border-radius: 14px;
-      padding: 16px;
-    }
-    .card p {
-      color: var(--muted);
-      min-height: 56px;
-      line-height: 1.45;
-    }
-    input, textarea, button {
-      width: 100%;
-      padding: 12px 14px;
-      border-radius: 10px;
-      border: 1px solid var(--line);
-      background: #111827;
-      color: var(--text);
-      font-size: 1rem;
-      margin-top: 10px;
-    }
-    button {
-      cursor: pointer;
-      background: linear-gradient(90deg, var(--green), var(--blue));
-      border: none;
-      color: #06101b;
-      font-weight: 800;
-    }
-    .progress {
-      width: 100%;
-      height: 16px;
-      background: rgba(255,255,255,0.08);
-      border-radius: 999px;
-      overflow: hidden;
-      margin-top: 12px;
-      border: 1px solid var(--line);
-    }
-    .progress-bar {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, var(--green), var(--blue));
-      transition: width 0.2s ease;
-    }
-    .muted { color: var(--muted); font-size: 0.9rem; }
-    .answer {
-      margin-top: 12px;
-      white-space: pre-wrap;
-      min-height: 120px;
-      background: rgba(15,23,42,0.95);
-      border: 1px solid var(--line);
-      border-radius: 12px;
-      padding: 16px;
-      line-height: 1.6;
-    }
-    .error { color: var(--red); font-weight: 700; }
-  </style>
-</head>
-<body>
-  <div class="wrap">
-    <h1>Termux LLM Manager</h1>
-    <p class="muted">Download a GGUF model, then chat locally in the browser.</p>
-
-    <div class="panel">
-      <h2>1) Recommended models</h2>
-      <div class="grid">
-        {% for m in models %}
-        <div class="card">
-          <h3>{{ m.name }}</h3>
-          <p>{{ m.description }}</p>
-          <form method="post" action="/download">
-            <input type="hidden" name="model_key" value="{{ m.key }}">
-            <button type="submit">Download</button>
-          </form>
-        </div>
-        {% endfor %}
-      </div>
-    </div>
-
-    <div class="panel">
-      <h2>2) Custom GGUF URL</h2>
-      <form method="post" action="/download">
-        <input type="text" name="custom_model" placeholder="Paste a direct GGUF URL (required)">
-        <input type="text" name="custom_filename" placeholder="Optional custom filename">
-        <button type="submit">Download custom model</button>
-      </form>
-    </div>
-
-    <div class="panel">
-      <h2>3) Download status</h2>
-      {% if task_id %}
-      <div id="status-message" class="muted">Loading...</div>
-      <div class="progress"><div id="progress-bar" class="progress-bar" style="width:0%"></div></div>
-      <div id="task-meta" class="muted">Task ID: {{ task_id }}</div>
-      {% else %}
-      <div class="muted">No active download task.</div>
-      {% endif %}
-      {% if active_model_name %}
-      <div class="muted">Active model: {{ active_model_name }}</div>
-      {% endif %}
-    </div>
-
-    <div class="panel">
-      <h2>4) Chat in browser</h2>
-      <textarea id="prompt" rows="7" placeholder="Ask something..."></textarea>
-      <button id="chat-btn" type="button">Generate response</button>
-      <div id="answer" class="answer">No response yet.</div>
-    </div>
-  </div>
-
-  <script>
-    const taskId = "{{ task_id or '' }}";
-
-    function refreshStatus() {
-      if (!taskId) return;
-      fetch('/status?task_id=' + encodeURIComponent(taskId))
-        .then(r => r.json())
-        .then(data => {
-          const msg = document.getElementById('status-message');
-          const bar = document.getElementById('progress-bar');
-          const meta = document.getElementById('task-meta');
-          if (msg) msg.textContent = data.message || 'Working...';
-          if (bar) bar.style.width = (data.progress || 0) + '%';
-          if (meta) meta.textContent = 'Task ID: ' + (data.task_id || taskId) + ' • Status: ' + (data.status || 'unknown');
-        })
-        .catch(() => {});
-    }
-
-    if (taskId) {
-      refreshStatus();
-      setInterval(refreshStatus, 2000);
-    }
-
-    document.getElementById('chat-btn').addEventListener('click', function () {
-      const prompt = document.getElementById('prompt').value.trim();
-      const answerEl = document.getElementById('answer');
-      if (!prompt) {
-        answerEl.textContent = 'Please enter a prompt first.';
-        return;
-      }
-
-      answerEl.textContent = 'Generating...';
-      fetch('/api/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ prompt: prompt })
-      })
-      .then(resp => resp.json())
-      .then(data => {
-        if (data.error) {
-          answerEl.className = 'answer error';
-          answerEl.textContent = 'Error: ' + data.error;
-        } else {
-          answerEl.className = 'answer';
-          answerEl.textContent = data.response || 'No response generated.';
-        }
-      })
-      .catch(err => {
-        answerEl.className = 'answer error';
-        answerEl.textContent = 'Chat request failed: ' + err;
-      });
-    });
-  </script>
-</body>
-</html>
-"""
-
-# -----------------------------
-# 8) Flask routes
-# -----------------------------
-app = Flask(__name__)
-
-@app.route("/")
-def home():
-    return render_template_string(
-        INDEX_TEMPLATE,
-        models=RECOMMENDED_MODELS,
-        task_id=None,
-        active_model_name=ACTIVE_MODEL.get("name")
-    )
-
-@app.route("/download", methods=["POST"])
-def download_route():
+# ---------- Flask web UI ----------
+def start_web_ui(model_path: str) -> None:
     try:
-        source = parse_selection(request.form)
-        task_id = uuid.uuid4().hex
-        set_task(task_id, "queued", "Queued download", 0.0, source.get("name"))
-        threading.Thread(target=download_worker, args=(task_id, source), daemon=True).start()
-        return redirect(f"/progress?task_id={task_id}")
-    except Exception as exc:
-        logging.exception("Download route failed: %s", exc)
-        return render_template_string(
-            INDEX_TEMPLATE,
-            models=RECOMMENDED_MODELS,
-            task_id=None,
-            active_model_name=ACTIVE_MODEL.get("name")
-        ) + f"<div class='error' style='padding:12px;'>Error: {exc}</div>"
+        from flask import Flask, request, jsonify, render_template_string
+    except Exception:
+        print(color("[fatal] Flask is not available. Please rerun the script and allow bootstrap to install it.", FG["red"]))
+        return
 
-@app.route("/progress")
-def progress_page():
-    task_id = request.args.get("task_id", "").strip()
-    if not task_id:
-        return redirect("/")
-    return render_template_string(
-        INDEX_TEMPLATE,
-        models=RECOMMENDED_MODELS,
-        task_id=task_id,
-        active_model_name=ACTIVE_MODEL.get("name")
-    )
-
-@app.route("/status")
-def status_route():
-    task_id = request.args.get("task_id", "").strip()
-    if not task_id:
-        return jsonify({"status": "idle", "message": "No active task", "progress": 0.0})
-
-    task = TASKS.get(task_id, {})
-    return jsonify({
-        "task_id": task_id,
-        "status": task.get("status", "idle"),
-        "message": task.get("message", "No task found"),
-        "progress": float(task.get("progress", 0.0)),
-        "name": task.get("name"),
-        "model_path": task.get("model_path")
-    })
-
-@app.route("/api/chat", methods=["POST"])
-def api_chat():
     try:
-        payload = request.get_json(silent=True) or {}
-        prompt = (payload.get("prompt") or "").strip()
-        if not prompt:
-            return jsonify({"error": "Prompt cannot be empty."}), 400
+        import llama_cpp
+    except Exception:
+        print(color("[fatal] llama-cpp-python is not available. The web UI cannot start without it.", FG["red"]))
+        return
 
-        model_path = ACTIVE_MODEL.get("path") or get_active_model_path()
-        if not model_path:
-            return jsonify({"error": "No model downloaded yet. Select a model and wait for download to finish."}), 400
+    app = Flask(__name__)
 
-        answer = run_local_inference(prompt, model_path)
-        return jsonify({"response": answer, "model_path": model_path})
+    llm = None
+    try:
+        llm = llama_cpp.Llama(
+            model_path=model_path,
+            n_ctx=4096,
+            n_threads=max(1, min(8, (os.cpu_count() or 4))),
+            n_batch=512,
+            verbose=False,
+        )
+        print(color("[webui] Model loaded for browser mode.", FG["green"]))
     except Exception as exc:
-        logging.exception("Chat request failed: %s", exc)
-        return jsonify({"error": str(exc)}), 500
+        print(color(f"[webui] Failed to load model: {exc}", FG["red"]))
+        return
 
-# -----------------------------
-# 9) Startup
-# -----------------------------
+    @app.route("/")
+    def index():
+        return render_template_string("""
+        <!doctype html>
+        <html>
+        <head>
+            <meta charset="utf-8">
+            <title>Termux Universal AI</title>
+            <style>
+                body { font-family: Arial, sans-serif; background: #0b1020; color: #eaf2ff; margin: 0; padding: 0; }
+                .wrap { max-width: 980px; margin: 40px auto; background: #121a2b; border: 1px solid #2d3d5d; border-radius: 16px; padding: 24px; box-shadow: 0 8px 30px rgba(0,0,0,0.25); }
+                h1 { margin-top:0; color:#7ad6ff; }
+                textarea, button { width: 100%; box-sizing: border-box; border-radius: 10px; border: 1px solid #394b6a; background: #0c1426; color: white; padding: 14px; font-size: 16px; }
+                textarea { min-height: 140px; }
+                button { margin-top: 16px; background: linear-gradient(135deg, #1a9fff, #7b61ff); border: none; color: white; cursor: pointer; font-weight: bold; }
+                .response { margin-top: 18px; background: #0d1728; border: 1px solid #2b3b59; border-radius: 10px; padding: 16px; white-space: pre-wrap; }
+                .small { color: #8ba7cf; font-size: 12px; }
+            </style>
+        </head>
+        <body>
+            <div class="wrap">
+                <h1>GitHub Hub: Termux Universal AI</h1>
+                <div class="small">Local CPU model • Browser UI • Android/Termux</div>
+                <textarea id="prompt" placeholder="Ask anything...">Hello, can you introduce yourself?</textarea>
+                <button onclick="ask()">Generate</button>
+                <div class="response" id="response">Waiting for input...</div>
+            </div>
+            <script>
+                async function ask() {
+                    const prompt = document.getElementById('prompt').value;
+                    const responseBox = document.getElementById('response');
+                    responseBox.textContent = 'Thinking...';
+                    try {
+                        const res = await fetch('/api/chat', {
+                            method: 'POST',
+                            headers: {'Content-Type': 'application/json'},
+                            body: JSON.stringify({prompt})
+                        });
+                        const data = await res.json();
+                        responseBox.textContent = data.reply || 'No response.';
+                    } catch (e) {
+                        responseBox.textContent = 'Error: ' + e.toString();
+                    }
+                }
+            </script>
+        </body>
+        </html>
+        """)
+
+    @app.route("/api/chat", methods=["POST"])
+    def api_chat():
+        payload = request.get_json(force=True, silent=True) or {}
+        prompt = payload.get("prompt", "")
+        if not prompt.strip():
+            return jsonify({"reply": "Please enter a prompt."}), 400
+
+        full_prompt = f"USER: {prompt}\\nASSISTANT:"
+        try:
+            result = llm(
+                full_prompt,
+                max_tokens=220,
+                temperature=0.7,
+                top_p=0.95,
+                stop=["</s>", "USER:", "###"],
+                echo=False,
+            )
+            reply = result.get("choices", [{}])[0].get("text", "").strip()
+            return jsonify({"reply": reply or "No response generated."})
+        except Exception as exc:
+            return jsonify({"reply": f"Error: {exc}"}), 500
+
+    host = "0.0.0.0"
+    port = 7860
+    print(color(f"[webui] Starting local server at http://127.0.0.1:{port}", FG["green"]))
+    print(color(f"[webui] Browser access: http://{socket.gethostbyname(socket.gethostname())}:{port}", FG["cyan"]))
+    app.run(host=host, port=port, debug=False, use_reloader=False)
+
+# ---------- Main menu flow ----------
+def main() -> None:
+    bootstrap()
+    print_header()
+    render_status_flags()
+    print()
+    repo, file_name, model_label = prompt_model_choice()
+
+    # If model is custom and repo is empty, retry
+    if not repo or not file_name:
+        print(color("Custom model requires repo + file.", FG["red"]))
+        return
+
+    try:
+        model_path = download_model(repo, file_name, model_label)
+    except Exception:
+        print(color("[fatal] Model download failed. Check your network and repository path.", FG["red"]))
+        return
+
+    while True:
+        print()
+        print(color("Execution mode", FG["yellow"] + BOLD))
+        print(color("1) CLI chat mode (Termux terminal)", FG["cyan"]))
+        print(color("2) Web UI mode (browser)", FG["cyan"]))
+        print(color("3) Exit", FG["cyan"]))
+        choice = safe_input(color("Choose mode [1-3]: ", FG["green"])).strip()
+
+        if choice == "1":
+            cli_chat_mode(str(model_path))
+            break
+        elif choice == "2":
+            start_web_ui(str(model_path))
+            break
+        elif choice == "3":
+            print(color("Exiting.", FG["yellow"]))
+            break
+        else:
+            print(color("Invalid choice. Please select 1, 2, or 3.", FG["red"]))
+
 if __name__ == "__main__":
-    host = os.environ.get("HOST", "0.0.0.0")
-    port = int(os.environ.get("PORT", "5000"))
-
-    print("")
-    print("============================================")
-    print("Termux LLM Manager")
-    print("============================================")
-    print(f"Model storage: {MODEL_DIR}")
-    print(f"Open in browser: http://localhost:{port}")
-    print("Use only: python app.py")
-    print("============================================")
-    print("")
-
-    app.run(host=host, port=port, debug=False, threaded=True)
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        print(color("Interrupted by user.", FG["yellow"]))
+    except Exception as exc:
+        print()
+        print(color(f"[fatal] Unexpected error: {exc}", FG["red"]))
+        try:
+            import traceback
+            traceback.print_exc()
+        except Exception:
+            pass
+        sys.exit(1)
