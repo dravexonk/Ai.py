@@ -1,7 +1,16 @@
 #!/usr/bin/env python3
 # app.py
-# Zero-configuration Termux-friendly local model downloader + local chat UI
-# Works on Android/Termux with Flask and llama-cpp-python if available.
+# Termux-only self-bootstrap local web app
+# Usage:
+#   python app.py
+#
+# Features:
+# - auto installs Termux packages if needed
+# - auto installs Python dependencies via pip
+# - sets up model download directory
+# - downloads GGUF model from Hugging Face / direct URL
+# - serves local browser UI
+# - tries local inference with llama-cpp-python if available
 
 import json
 import logging
@@ -12,702 +21,542 @@ import subprocess
 import sys
 import threading
 import time
-import traceback
 import uuid
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from urllib.parse import urlparse, unquote
 
-# --------------------------------------------------------------------
-# 1) Dependency bootstrap before importing flask / huggingface_hub
-# --------------------------------------------------------------------
-def ensure_python_dependencies():
-    required = ["flask", "requests", "huggingface_hub", "tqdm"]
-    missing = []
+# ------------------------------------------------------------
+# 0) Basic logging setup
+# ------------------------------------------------------------
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 
-    for pkg in required:
+# ------------------------------------------------------------
+# 1) System bootstrap for Termux
+# ------------------------------------------------------------
+def run_command(cmd, timeout=600, allow_fail=False):
+    logging.info("Running: %s", " ".join(cmd))
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if proc.stdout:
+            logging.info(proc.stdout[:2000])
+        if proc.stderr:
+            logging.warning(proc.stderr[:2000])
+        if proc.returncode != 0 and not allow_fail:
+            raise RuntimeError(f"Command failed ({proc.returncode}): {' '.join(cmd)}")
+        return proc.returncode == 0, proc.stdout, proc.stderr
+    except Exception as exc:
+        if allow_fail:
+            logging.warning("Ignoring command failure: %s", exc)
+            return False, "", str(exc)
+        raise
+
+def ensure_termux_system_packages():
+    # Only for Termux
+    termux_path = "/data/data/com.termux/files/home"
+    if not os.path.exists(termux_path):
+        return True  # not Termux
+
+    pkg = shutil.which("pkg")
+    if not pkg:
+        logging.warning("pkg command not found; skipping Termux system package install.")
+        return True
+
+    # Install/update required tools if missing on Termux
+    packages = ["git", "curl", "wget", "openssl-tool"]
+    missing = []
+    for p in packages:
+        found = shutil.which(p)
+        if not found:
+            missing.append(p)
+
+    if missing:
+        logging.info("Installing required Termux packages: %s", ", ".join(missing))
+        ok, _, err = run_command([pkg, "update", "-y"], allow_fail=True)
+        ok2, _, err2 = run_command([pkg, "install", "-y", *missing], allow_fail=True)
+        if not ok2:
+            logging.warning("Could not install all required packages: %s", err2)
+            # do not crash; app may still work if enough packages already present
+
+    # Ensure Python package manager is ready
+    if not shutil.which("python"):
+        run_command([pkg, "install", "-y", "python"], allow_fail=True)
+
+    return True
+
+# ------------------------------------------------------------
+# 2) Python dependency bootstrap (pip)
+# ------------------------------------------------------------
+def ensure_pip_dependencies():
+    packages = ["flask", "requests", "tqdm", "huggingface_hub"]
+
+    missing = []
+    for pkg in packages:
         try:
             __import__(pkg.replace("-", "_"))
         except Exception:
             missing.append(pkg)
 
-    if missing:
-        logging.info("Installing missing Python dependencies: %s", ", ".join(missing))
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--upgrade", *missing],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logging.exception("Failed to install required Python dependencies: %s", e)
+    if not missing:
+        return True
 
-    # Optional install: llama-cpp-python for local inference.
+    logging.info("Installing missing Python dependencies: %s", " ".join(missing))
+
+    env = os.environ.copy()
+    env["PIP_BREAK_SYSTEM_PACKAGES"] = "1"
+
+    cmd = [sys.executable, "-m", "pip", "install", "--upgrade", "--no-cache-dir", *missing]
     try:
-        __import__("llama_cpp")
-        logging.info("llama-cpp-python is available.")
-    except Exception:
-        try:
-            logging.info("Attempting to install optional package: llama-cpp-python")
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", "--upgrade", "llama-cpp-python"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-        except Exception as e:
-            logging.warning("Could not install llama-cpp-python automatically: %s", e)
-            logging.warning("The app will still work for downloads and will provide a clean fallback message during chat.")
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+        if proc.stdout:
+            logging.info(proc.stdout[:2000])
+        if proc.stderr:
+            logging.warning(proc.stderr[:2000])
+        if proc.returncode != 0:
+            logging.warning("Pip install returned exit code %s", proc.returncode)
+            # Keep going; some packages may fail on Termux but app still should work for direct downloads.
+            return False
+        return True
+    except Exception as exc:
+        logging.exception("Exception while installing Python dependencies: %s", exc)
+        return False
 
-ensure_python_dependencies()
+# Run the bootstrap BEFORE importing Flask
+ensure_termux_system_packages()
+ensure_pip_dependencies()
 
-# Now import app stack
-import requests
-from flask import Flask, jsonify, redirect, render_template_string, request, url_for
-from huggingface_hub import snapshot_download
+# Now it's safe to import Flask etc.
+try:
+    import requests
+    from flask import Flask, jsonify, redirect, render_template_string, request
+except Exception as exc:
+    logging.exception("Failed to import Flask or requests after dependency installation: %s", exc)
+    print("")
+    print("Dependency setup did not complete.")
+    print("Please run these manually in Termux if needed:")
+    print("  pkg update -y")
+    print("  pkg install -y git curl wget openssl-tool")
+    print("  python -m pip install --upgrade pip setuptools wheel")
+    print("  python -m pip install --upgrade flask requests tqdm huggingface_hub")
+    print("")
+    sys.exit(1)
 
-# --------------------------------------------------------------------
-# 2) Global config and directories
-# --------------------------------------------------------------------
-LOGGING_FORMAT = "%(asctime)s %(levelname)s %(message)s"
-logging.basicConfig(level=logging.INFO, format=LOGGING_FORMAT)
-
+# ------------------------------------------------------------
+# 3) Model storage and app config
+# ------------------------------------------------------------
 APP_ROOT = Path(__file__).resolve().parent
-DEFAULT_MODEL_ROOT = Path(
-    os.environ.get(
-        "TERMUX_MODEL_DIR",
-        str(Path.home() / "storage" / "shared" / "termux_models"),
-    )
-)
-if not DEFAULT_MODEL_ROOT.exists():
-    try:
-        DEFAULT_MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-    except Exception:
-        DEFAULT_MODEL_ROOT = APP_ROOT / "models"
-        DEFAULT_MODEL_ROOT.mkdir(parents=True, exist_ok=True)
-
-MODEL_DIR = DEFAULT_MODEL_ROOT
+MODEL_DIR = Path(os.environ.get("TERMUX_MODEL_DIR", str(Path.home() / "storage" / "shared" / "termux_models"))).resolve()
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
-# Track background tasks / model state
 TASKS = {}
+TASK_LOCK = threading.Lock()
+
 ACTIVE_MODEL = {
     "name": None,
     "path": None,
-    "repo_id": None,
-    "source_url": None,
+    "source": None
 }
-TASK_LOCK = threading.Lock()
-DOWNLOAD_EXECUTOR = ThreadPoolExecutor(max_workers=2)
 
-# Recommended models (light/mobile friendly and popular reasonable options)
-MODEL_CATALOG = [
+# Recommended lightweight models (direct GGUF URLs)
+RECOMMENDED_MODELS = [
     {
-        "key": "llama3_1_8b",
-        "name": "Llama 3.1 8B Instruct (mobile-friendly GGUF)",
-        "repo_id": "unsloth/Meta-Llama-3.1-8B-Instruct-GGUF",
-        "description": "Strong general-purpose model, good balance for Android/Termux",
+        "key": "tinyllama_1_1b",
+        "name": "TinyLlama 1.1B Chat",
+        "url": "https://huggingface.co/TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF/resolve/main/tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        "description": "Very light, best for low-memory Android."
     },
     {
-        "key": "mistral_7b",
-        "name": "Mistral 7B Instruct",
-        "repo_id": "TheBloke/Mistral-7B-Instruct-v0.2-GGUF",
-        "description": "Fast and capable, widely used 7B model",
-    },
-    {
-        "key": "gemma_2_2b",
-        "name": "Gemma 2 2B Instruct",
-        "repo_id": "TheBloke/gemma-2-2b-it-GGUF",
-        "description": "Very lightweight and good for lower-end Android devices",
+        "key": "gemma_2b",
+        "name": "Gemma 2 2B",
+        "url": "https://huggingface.co/TheBloke/gemma-2-2b-it-GGUF/resolve/main/gemma-2-2b-it.Q4_K_M.gguf",
+        "description": "Small but capable general model."
     },
     {
         "key": "phi3_mini",
         "name": "Phi-3 Mini Instruct",
-        "repo_id": "microsoft/Phi-3-mini-4k-instruct-gguf",
-        "description": "Very good small model for mobile environments",
+        "url": "https://huggingface.co/microsoft/Phi-3-mini-4k-instruct-gguf/resolve/main/Phi-3-mini-4k-instruct-q4.gguf",
+        "description": "Good small model for mobile use."
     },
     {
-        "key": "tinyllama",
-        "name": "TinyLlama 1.1B Chat",
-        "repo_id": "TheBloke/TinyLlama-1.1B-Chat-v1.0-GGUF",
-        "description": "Very small model, best for low-memory devices",
+        "key": "mistral_7b",
+        "name": "Mistral 7B Instruct",
+        "url": "https://huggingface.co/TheBloke/Mistral-7B-Instruct-v0.2-GGUF/resolve/main/mistral-7b-instruct-v0.2.Q4_K_M.gguf",
+        "description": "Popular 7B model; better if device has more RAM."
+    },
+    {
+        "key": "llama3_1_8b",
+        "name": "Llama 3.1 8B Instruct",
+        "url": "https://huggingface.co/unsloth/Meta-Llama-3.1-8B-Instruct-GGUF/resolve/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+        "description": "Good if your device has enough memory."
     },
 ]
 
-# --------------------------------------------------------------------
-# 3) Utility functions
-# --------------------------------------------------------------------
-def safe_filename(name: str) -> str:
-    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name or "model.gguf")
-    return cleaned[:200] or "model.gguf"
+# ------------------------------------------------------------
+# 4) Utility helpers
+# ------------------------------------------------------------
+def safe_filename(name):
+    s = unquote((name or "model.gguf").strip())
+    s = re.sub(r"[^A-Za-z0-9._-]+", "_", s)
+    s = s[:200] or "model.gguf"
+    return s
 
-def determine_model_path_from_downloaded_repo(root_dir: Path):
-    candidates = sorted(root_dir.rglob("*.gguf"))
-    if not candidates:
-        # Some repos may store .gguf in nested directories or use symlinks.
-        candidates = sorted(root_dir.rglob("*.GGUF"))
-    if not candidates:
-        raise FileNotFoundError(f"No .gguf file found under {root_dir}")
-    return str(candidates[0])
-
-def choose_best_gguf(files):
-    pick = None
-    best_score = -999999
-    for file in files:
-        name = str(file).lower()
-        score = 0
-        if name.endswith(".gguf"):
-            score += 100
-        if "q4" in name:
-            score += 25
-        if "q5" in name:
-            score += 20
-        if "q8" in name:
-            score += 15
-        if "k_m" in name:
-            score += 15
-        if "instruct" in name:
-            score += 10
-        if "phi" in name:
-            score += 8
-        if "tinyllama" in name:
-            score += 6
-        if "f16" in name or "fp16" in name:
-            score -= 10
-        if "q2" in name:
-            score -= 15
-        if "q3" in name:
-            score -= 5
-        if "4bit" in name:
-            score += 7
-        if "8bit" in name:
-            score += 5
-        # Prefer smaller but not too tiny, but this is a rough heuristic.
-        if score > best_score:
-            best_score = score
-            pick = file
-    return str(pick or files[0])
-
-def list_downloaded_models():
-    results = []
-    try:
-        for file in sorted(MODEL_DIR.rglob("*.gguf")):
-            if file.is_file():
-                results.append(str(file))
-        for file in sorted(MODEL_DIR.rglob("*.GGUF")):
-            if file.is_file() and str(file) not in results:
-                results.append(str(file))
-    except Exception:
-        pass
-    return results
-
-def resolve_repo_id(raw_value):
-    value = (raw_value or "").strip()
-    if not value:
-        raise ValueError("No model was provided.")
-    if value.lower().startswith("http://") or value.lower().startswith("https://"):
-        return {"kind": "url", "url": value}
-    if "/" not in value:
-        raise ValueError("Model repo ID must look like 'owner/repo' or be a direct URL.")
-    return {"kind": "hf", "repo_id": value}
-
-def get_model_input_from_request(form):
-    # Preferred UI flow: card buttons send model_key, custom input optional.
-    custom = (form.get("custom_model") or "").strip()
-    custom_filename = (form.get("custom_filename") or "").strip()
-    selected_key = (form.get("model_key") or "").strip()
-
-    if selected_key:
-        for model in MODEL_CATALOG:
-            if model["key"] == selected_key:
-                return {
-                    "kind": "hf",
-                    "repo_id": model["repo_id"],
-                    "filename": None,
-                    "name": model["name"],
-                }
-        raise ValueError(f"Unknown recommended model key: {selected_key}")
-
-    if custom:
-        data = resolve_repo_id(custom)
-        data["filename"] = custom_filename or None
-        return data
-
-    raise ValueError("Please select a model or enter a custom one.")
-
-def find_gguf_file_for_hf_repo(repo_id: str, filename_hint: str = None):
-    try:
-        if filename_hint:
-            # direct file name known
-            from huggingface_hub import hf_hub_download
-            final_path = hf_hub_download(
-                repo_id=repo_id,
-                filename=filename_hint,
-                local_dir=str(MODEL_DIR),
-                local_dir_use_symlinks=False,
-            )
-            return final_path
-
-        # Auto-select the best .gguf file from the repo
-        local_snapshot = snapshot_download(
-            repo_id=repo_id,
-            repo_type="model",
-            local_dir=str(MODEL_DIR),
-            allow_patterns=["*.gguf", "*.GGUF"],
-            local_dir_use_symlinks=False,
-            resume_download=True,
-            token=None,
-        )
-        snapshot_path = Path(local_snapshot)
-        files = []
-        for f in snapshot_path.rglob("*"):
-            if f.is_file() and f.suffix.lower() == ".gguf":
-                files.append(f)
-        if not files:
-            raise FileNotFoundError(f"No GGUF model files were found in repository: {repo_id}")
-        return str(choose_best_gguf(files))
-    except Exception as exc:
-        logging.exception("GGUF repo lookup failed for %s", repo_id)
-        raise
-
-def download_from_direct_url(url: str):
-    parsed = urlparse(url)
-    if not parsed.scheme or not parsed.netloc:
-        raise ValueError(f"Invalid download URL: {url}")
-
-    filename = safe_filename(unquote(parsed.path.split("/")[-1]) or "downloaded_model.gguf")
-    target_path = MODEL_DIR / filename
-
-    # If the file already exists, reuse it
-    if target_path.exists():
-        return str(target_path)
-
-    with requests.get(url, stream=True, timeout=60) as r:
-        r.raise_for_status()
-        total = int(r.headers.get("Content-Length", 0) or 0)
-        downloaded = 0
-        with open(target_path, "wb") as f:
-            for chunk in r.iter_content(chunk_size=65536):
-                if chunk:
-                    f.write(chunk)
-                    downloaded += len(chunk)
-                    if total:
-                        progress = min(100.0, (downloaded / total) * 100.0)
-                    else:
-                        progress = 0.0
-                    # status is updated in the caller around this function
-                    yield progress
-
-    return str(target_path)
-
-def set_task(task_id, status, message, progress=0.0, model_path=None, name=None):
+def set_task(task_id, status, message, progress=0.0, name=None, model_path=None):
     with TASK_LOCK:
         TASKS[task_id] = {
             "task_id": task_id,
-            "status": status,  # queued, downloading, complete, error
+            "status": status,
             "message": message,
             "progress": float(progress),
-            "model_path": model_path,
             "name": name,
+            "model_path": model_path
         }
 
+def parse_user_selection(form):
+    selected_key = (form.get("model_key") or "").strip()
+    custom_model = (form.get("custom_model") or "").strip()
+    custom_filename = (form.get("custom_filename") or "").strip()
+
+    if selected_key:
+        for model in RECOMMENDED_MODELS:
+            if model["key"] == selected_key:
+                return {"type": "url", "url": model["url"], "name": model["name"]}
+        raise ValueError(f"Unknown recommended model key: {selected_key}")
+
+    if custom_model:
+        model = custom_model.strip()
+        if model.lower().startswith("http://") or model.lower().startswith("https://"):
+            # direct URL download
+            return {
+                "type": "url",
+                "url": model,
+                "name": custom_filename or safe_filename(urlparse(model).path.split("/")[-1]) or "custom_model.gguf"
+            }
+
+        if "/" in model:
+            # owner/repo input. Try huggingface_hub or direct guess.
+            repo_id = model
+            try:
+                from huggingface_hub import hf_hub_download
+                # If user gave repo id without file and direct file hint may be missing, try the repo root
+                # but this usually fails and tells them to provide direct URL.
+                raise ValueError("Repository ID was provided without explicit GGUF file. Please paste a direct GGUF URL instead.")
+            except Exception:
+                raise ValueError(
+                    "For custom Hugging Face repo input, paste a direct GGUF download URL if possible. "
+                    "Example: https://huggingface.co/.../resolve/main/model.gguf"
+                )
+
+        raise ValueError("Custom model must be a direct URL or 'owner/repo' with a direct GGUF file URL.")
+
+    raise ValueError("No model selected.")
+
+def list_downloaded_models():
+    files = []
+    for p in MODEL_DIR.rglob("*"):
+        if p.is_file() and p.suffix.lower() == ".gguf":
+            files.append(str(p))
+    return sorted(files)
+
 def get_active_model_path():
-    if ACTIVE_MODEL.get("path") and Path(ACTIVE_MODEL["path"]).exists():
-        return ACTIVE_MODEL["path"]
-    downloaded = list_downloaded_models()
-    if downloaded:
-        return downloaded[0]
+    models = list_downloaded_models()
+    if models:
+        return models[0]
     return None
 
-def generate_local_response(prompt: str, model_path: str):
-    if not model_path or not Path(model_path).exists():
-        raise FileNotFoundError("The model file does not exist on disk.")
+def download_file(url, target_path, progress_callback=None):
+    response = requests.get(url, stream=True, timeout=120)
+    response.raise_for_status()
+    total = int(response.headers.get("Content-Length", "0") or 0)
+    downloaded = 0
 
-    # Try llama-cpp-python first.
+    with open(target_path, "wb") as fh:
+        for chunk in response.iter_content(chunk_size=65536):
+            if not chunk:
+                continue
+            fh.write(chunk)
+            downloaded += len(chunk)
+            if progress_callback:
+                if total > 0:
+                    pct = min(100.0, (downloaded / total) * 100.0)
+                else:
+                    pct = 0.0
+                progress_callback(pct)
+
+def run_local_inference(prompt, model_path):
+    # 1) Try llama_cpp
     try:
-        from llama_cpp import Llama
-        llm = Llama(model_path=model_path, n_ctx=4096, n_gpu_layers=0, verbose=False)
-        response = llm.create_chat_completion(
+        import llama_cpp
+        llm = llama_cpp.Llama(model_path=model_path, n_ctx=4096, verbose=False)
+        resp = llm.create_chat_completion(
             messages=[{"role": "user", "content": prompt}],
             max_tokens=256,
             temperature=0.7,
         )
-        answer = response.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
-        if answer:
-            return answer
-        return "No response generated."
+        text = resp.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if text:
+            return text
     except Exception as exc:
-        logging.exception("llama_cpp generation path failed: %s", exc)
+        logging.warning("llama_cpp backend failed: %s", exc)
 
-    # Fallback: if llama.cpp CLI is installed on the system, try it.
-    binary_candidates = ["llama-cli", "llama", "llama-server", "main", "./main"]
-    for candidate in binary_candidates:
+    # 2) Fallback to llama.cpp CLI if installed
+    for candidate in ["llama-cli", "llama", "llama-server", "main", "./main"]:
         found = shutil.which(candidate)
-        if found:
-            try:
-                cmd = [found, "--model", model_path, "--prompt", prompt, "--n-predict", "256", "--ctx-size", "4096"]
-                proc = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-                out = proc.stdout.strip() + "\n" + proc.stderr.strip()
-                if out.strip():
-                    return out.strip()
-            except Exception as inner_exc:
-                logging.warning("CLI fallback failed using %s: %s", candidate, inner_exc)
-                continue
+        if not found:
+            continue
+        try:
+            proc = subprocess.run(
+                [found, "--model", model_path, "--prompt", prompt, "--n-predict", "256", "--ctx-size", "4096"],
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+            out = (proc.stdout or "") + "\n" + (proc.stderr or "")
+            if out.strip():
+                return out.strip()
+        except Exception as e:
+            logging.warning("CLI fallback failed for %s: %s", candidate, e)
 
     raise RuntimeError(
         "No working local inference backend was found. "
-        "The app tried llama-cpp-python and local llama.cpp binaries but none were available. "
-        "You can still download and keep the model; to chat locally, install llama-cpp-python or llama.cpp."
+        "Install llama-cpp-python or llama.cpp CLI manually for local chat."
     )
 
-# --------------------------------------------------------------------
-# 4) Background download workers
-# --------------------------------------------------------------------
-def download_model_task(task_id: str, source_data: dict):
-    set_task(task_id, "downloading", "Preparing download...", 0.0)
-
+# ------------------------------------------------------------
+# 5) Download worker
+# ------------------------------------------------------------
+def download_worker(task_id, source):
     try:
-        if source_data.get("kind") == "hf":
-            repo_id = source_data.get("repo_id")
-            filename = source_data.get("filename") or None
-            model_name = source_data.get("name") or repo_id
+        url = source["url"]
+        model_name = source["name"]
+        target = MODEL_DIR / safe_filename(model_name)
 
-            if not repo_id:
-                raise ValueError("Repository ID is required.")
-
-            set_task(task_id, "downloading", f"Downloading from Hugging Face: {repo_id}", 0.0, None, model_name)
-
-            model_path = find_gguf_file_for_hf_repo(repo_id, filename)
-            final_path = Path(model_path)
-
-            # Some repos may download into nested directories; no issue.
-            if final_path.exists():
-                with TASK_LOCK:
-                    TASKS[task_id]["status"] = "complete"
-                    TASKS[task_id]["message"] = f"Model ready: {model_name}"
-                    TASKS[task_id]["progress"] = 100.0
-                    TASKS[task_id]["model_path"] = str(final_path)
-                    TASKS[task_id]["name"] = model_name
-                global ACTIVE_MODEL
-                ACTIVE_MODEL["name"] = model_name
-                ACTIVE_MODEL["path"] = str(final_path)
-                ACTIVE_MODEL["repo_id"] = repo_id
-                ACTIVE_MODEL["source_url"] = None
-                logging.info("HF model downloaded to %s", final_path)
-                return
-
-            raise FileNotFoundError(f"Downloaded model file not found for repo: {repo_id}")
-
-        elif source_data.get("kind") == "url":
-            url = source_data.get("url")
-            if not url:
-                raise ValueError("No direct URL was provided.")
-            model_name = source_data.get("name") or urlparse(url).path.split("/")[-1] or "downloaded_model.gguf"
-            set_task(task_id, "downloading", f"Downloading model from direct URL: {url}", 0.0, None, model_name)
-
-            total_bytes = 0
-            try:
-                with requests.get(url, stream=True, timeout=60) as r:
-                    total_bytes = int(r.headers.get("Content-Length", "0") or "0")
-                    filename = safe_filename(unquote((urlparse(url).path).split("/")[-1]) or "downloaded_model.gguf")
-                    target_path = MODEL_DIR / filename
-                    downloaded = 0
-                    with open(target_path, "wb") as f:
-                        for chunk in r.iter_content(chunk_size=65536):
-                            if not chunk:
-                                continue
-                            f.write(chunk)
-                            downloaded += len(chunk)
-                            if total_bytes > 0:
-                                progress = min(100.0, (downloaded / total_bytes) * 100.0)
-                            else:
-                                progress = 0.0
-                            with TASK_LOCK:
-                                TASKS[task_id]["progress"] = float(progress)
-                                TASKS[task_id]["message"] = f"Downloading {filename}: {int(progress)}%"
-                    if not target_path.exists():
-                        raise FileNotFoundError("Downloaded file could not be written.")
-            except requests.RequestException as exc:
-                raise RuntimeError(f"Failed to fetch URL: {exc}") from exc
-
-            with TASK_LOCK:
-                TASKS[task_id]["status"] = "complete"
-                TASKS[task_id]["message"] = f"Model ready: {model_name}"
-                TASKS[task_id]["progress"] = 100.0
-                TASKS[task_id]["model_path"] = str(MODEL_DIR / safe_filename(model_name))
-                TASKS[task_id]["name"] = model_name
-
-            target_path = MODEL_DIR / safe_filename(model_name)
-            if not target_path.exists():
-                target_path = MODEL_DIR / safe_filename(urlparse(url).path.split("/")[-1] or "downloaded_model.gguf")
-            ACTIVE_MODEL["name"] = model_name
-            ACTIVE_MODEL["path"] = str(target_path)
-            ACTIVE_MODEL["repo_id"] = None
-            ACTIVE_MODEL["source_url"] = url
-            logging.info("Direct URL model downloaded to %s", target_path)
-            return
-
+        # If already exists, do not redownload
+        if target.exists():
+            logging.info("Model already exists at %s", target)
         else:
-            raise ValueError("Unsupported model source.")
+            set_task(task_id, "downloading", f"Downloading {model_name}...", 0.0, model_name)
+
+            def progress_cb(pct):
+                with TASK_LOCK:
+                    TASKS[task_id]["progress"] = float(pct)
+                    TASKS[task_id]["message"] = f"Downloading {model_name}: {pct:.1f}%"
+
+            download_file(url, str(target), progress_cb)
+
+        if not target.exists():
+            raise FileNotFoundError(f"Downloaded model file not found: {target}")
+
+        global ACTIVE_MODEL
+        ACTIVE_MODEL["name"] = model_name
+        ACTIVE_MODEL["path"] = str(target)
+        ACTIVE_MODEL["source"] = url
+
+        with TASK_LOCK:
+            TASKS[task_id]["status"] = "complete"
+            TASKS[task_id]["progress"] = 100.0
+            TASKS[task_id]["message"] = f"Model ready: {model_name}"
+            TASKS[task_id]["model_path"] = str(target)
+
+        logging.info("Download complete: %s", target)
+
     except Exception as exc:
-        logging.exception("Model download task failed: %s", exc)
+        logging.exception("Model download worker failed: %s", exc)
         with TASK_LOCK:
             TASKS[task_id]["status"] = "error"
             TASKS[task_id]["message"] = str(exc)
-            TASKS[task_id]["progress"] = 0.0
-            TASKS[task_id]["error"] = traceback.format_exc()
 
-# --------------------------------------------------------------------
-# 5) Flask app
-# --------------------------------------------------------------------
+# ------------------------------------------------------------
+# 6) Flask UI
+# ------------------------------------------------------------
 app = Flask(__name__)
 
-INDEX_HTML = """
+INDEX_TEMPLATE = """
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Termux LLM Manager</title>
+  <title>Termux Model Manager</title>
   <style>
     :root {
-      color-scheme: dark;
-      --bg: #111827;
-      --panel: #1f2937;
-      --panel-2: #0f172a;
+      --bg: #0b1120;
+      --panel: rgba(17,24,39,0.95);
+      --card: rgba(15,23,42,0.95);
       --text: #e5e7eb;
-      --muted: #a1a1aa;
-      --accent: #60a5fa;
-      --accent-2: #34d399;
-      --danger: #f87171;
-      --border: rgba(255,255,255,0.12);
+      --muted: #94a3b8;
+      --line: rgba(255,255,255,0.12);
+      --green: #34d399;
+      --blue: #60a5fa;
     }
     * { box-sizing: border-box; }
     body {
       margin: 0;
-      font-family: system-ui, -apple-system, sans-serif;
-      background: linear-gradient(180deg, var(--bg), #020817);
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: linear-gradient(180deg, #020817, var(--bg));
       color: var(--text);
-      min-height: 100vh;
       padding: 24px;
     }
     .wrap {
       max-width: 1100px;
       margin: 0 auto;
     }
-    h1 { margin-bottom: 8px; }
-    .subtitle { color: var(--muted); margin-bottom: 24px; }
+    h1, h2, h3 { margin-top: 0; }
+    .panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 18px;
+      padding: 20px;
+      margin-bottom: 24px;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.25);
+    }
     .grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(260px, 1fr));
-      gap: 18px;
-      margin-bottom: 28px;
+      grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+      gap: 16px;
     }
-    .card, .panel {
-      background: rgba(31,41,55,0.92);
-      border: 1px solid var(--border);
-      border-radius: 16px;
-      padding: 18px;
-      box-shadow: 0 8px 18px rgba(0,0,0,0.2);
-    }
-    .card h3 {
-      margin: 0 0 10px 0;
-      font-size: 1.1rem;
+    .card {
+      background: var(--card);
+      border: 1px solid var(--line);
+      border-radius: 14px;
+      padding: 16px;
     }
     .card p {
       color: var(--muted);
-      min-height: 42px;
-      margin: 0 0 14px 0;
-      line-height: 1.4;
+      min-height: 54px;
+      line-height: 1.45;
     }
-    .card button, .primary, .secondary {
-      border: none;
-      border-radius: 10px;
-      padding: 10px 14px;
-      font-size: 0.95rem;
-      cursor: pointer;
-      transition: 0.15s ease;
-    }
-    .card button, .primary {
-      background: var(--accent);
-      color: #08111d;
-      font-weight: 700;
-    }
-    .secondary {
-      background: var(--panel-2);
-      color: var(--text);
-      border: 1px solid var(--border);
-    }
-    .panel {
-      margin-bottom: 24px;
-    }
-    .custom-row {
-      display: flex;
-      gap: 10px;
-      flex-wrap: wrap;
-      margin-top: 12px;
-    }
-    input[type="text"], textarea {
+    input, textarea, button {
       width: 100%;
       padding: 12px 14px;
-      background: rgba(15, 23, 42, 0.9);
-      border: 1px solid var(--border);
       border-radius: 10px;
+      border: 1px solid var(--line);
+      background: #111827;
       color: var(--text);
       font-size: 1rem;
-      resize: vertical;
+      margin-top: 10px;
+    }
+    button {
+      cursor: pointer;
+      background: linear-gradient(90deg, var(--green), var(--blue));
+      border: none;
+      color: #08111d;
+      font-weight: 800;
     }
     .progress {
       width: 100%;
-      height: 14px;
+      height: 16px;
       background: rgba(255,255,255,0.08);
       border-radius: 999px;
       overflow: hidden;
-      margin: 12px 0 8px 0;
-      border: 1px solid var(--border);
+      margin-top: 12px;
+      border: 1px solid var(--line);
     }
     .progress-bar {
       height: 100%;
-      background: linear-gradient(90deg, var(--accent-2), var(--accent));
       width: 0%;
-      transition: width 0.35s ease;
+      background: linear-gradient(90deg, var(--green), var(--blue));
+      transition: width 0.2s ease;
     }
-    .status-text {
+    .muted {
       color: var(--muted);
-      font-size: 0.95rem;
-      margin-bottom: 12px;
+      font-size: 0.9rem;
     }
-    .chat-box {
-      width: 100%;
-      min-height: 140px;
-    }
-    .answer-box {
+    .answer {
       margin-top: 12px;
-      padding: 16px;
-      background: rgba(15,23,42,0.8);
-      border: 1px solid var(--border);
-      border-radius: 12px;
-      min-height: 120px;
       white-space: pre-wrap;
+      min-height: 120px;
+      background: rgba(15,23,42,0.95);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
       line-height: 1.5;
-      color: #e2e8f0;
     }
-    .small {
-      color: var(--muted);
-      font-size: 0.85rem;
-      margin-top: 8px;
+    .error {
+      color: #fca5a5;
+      font-weight: 600;
     }
-    .error { color: var(--danger); }
   </style>
 </head>
 <body>
   <div class="wrap">
-    <h1>Termux LLM Manager</h1>
-    <div class="subtitle">
-      Download a GGUF model from Hugging Face or a direct URL, then chat locally with llama-cpp-python (or a local llama.cpp binary if present).
-    </div>
+    <h1>Termux LLM Downloader</h1>
+    <p class="muted">Download a GGUF model and chat locally from your Android device.</p>
 
     <div class="panel">
-      <h2>1) Download a model</h2>
+      <h2>1) Recommended models</h2>
       <div class="grid">
-        {% for model in models %}
+        {% for m in models %}
         <div class="card">
-          <h3>{{ model.name }}</h3>
-          <p>{{ model.description }}<br><span class="small">{{ model.repo_id }}</span></p>
-          <form method="POST" action="/download">
-            <input type="hidden" name="model_key" value="{{ model.key }}">
+          <h3>{{ m.name }}</h3>
+          <p>{{ m.description }}</p>
+          <form method="post" action="/download">
+            <input type="hidden" name="model_key" value="{{ m.key }}">
             <button type="submit">Download</button>
           </form>
         </div>
         {% endfor %}
       </div>
+    </div>
 
-      <form method="POST" action="/download">
-        <label for="custom_model"><strong>Custom model:</strong></label>
-        <div class="custom-row">
-          <input id="custom_model" type="text" name="custom_model" placeholder="owner/repo or direct https://... URL">
-        </div>
-        <div class="custom-row">
-          <input type="text" name="custom_filename" placeholder="Optional GGUF file name (HF repos only)">
-        </div>
-        <div class="custom-row">
-          <button class="primary" type="submit">Download custom model</button>
-        </div>
+    <div class="panel">
+      <h2>2) Custom model</h2>
+      <form method="post" action="/download">
+        <input type="text" name="custom_model" placeholder="Paste direct GGUF URL or owner/repo">
+        <input type="text" name="custom_filename" placeholder="Optional file name (for direct URL only)">
+        <button type="submit">Download custom model</button>
       </form>
     </div>
 
     <div class="panel">
-      <h2>2) Download status</h2>
+      <h2>3) Download status</h2>
       {% if task_id %}
-      <div id="status-panel">
-        <div class="status-text" id="status-message">Loading...</div>
-        <div class="progress"><div id="progress-bar" class="progress-bar" style="width: 0%;"></div></div>
-        <div id="status-meta" class="small">Task ID: {{ task_id }}</div>
-      </div>
+      <div id="status-message" class="muted">Loading...</div>
+      <div class="progress"><div id="progress-bar" class="progress-bar" style="width:0%"></div></div>
+      <div id="task-meta" class="muted">Task ID: {{ task_id }}</div>
       {% else %}
-      <div class="status-text">No active download task.</div>
+      <div class="muted">No active download task.</div>
       {% endif %}
-
       {% if active_model_name %}
-      <div class="small" style="margin-top: 12px;">
-        Active model: <strong>{{ active_model_name }}</strong>
-      </div>
+      <div class="muted">Active model: {{ active_model_name }}</div>
       {% endif %}
     </div>
 
     <div class="panel">
-      <h2>3) Local chat</h2>
-      <form id="chat-form">
-        <textarea id="chat_prompt" class="chat-box" placeholder="Ask the model a question..."></textarea>
-        <div class="custom-row">
-          <button class="primary" type="submit">Generate response</button>
-          <button class="secondary" type="button" id="clear-chat">Clear</button>
-        </div>
-      </form>
-      <div id="answer-box" class="answer-box">No response yet. Download a model above and then ask a question.</div>
+      <h2>4) Local chat</h2>
+      <textarea id="prompt" rows="7" placeholder="Ask your model something..."></textarea>
+      <button id="chat-btn" type="button">Generate response</button>
+      <div id="answer" class="answer">No response yet.</div>
     </div>
   </div>
 
   <script>
     const taskId = "{{ task_id or '' }}";
-    function updateStatus() {
+    function refreshStatus() {
       if (!taskId) return;
       fetch('/status?task_id=' + encodeURIComponent(taskId))
         .then(r => r.json())
         .then(data => {
           const msg = document.getElementById('status-message');
           const bar = document.getElementById('progress-bar');
-          const meta = document.getElementById('status-meta');
-          if (!msg || !bar || !meta) return;
-          if (data && data.message) {
-            msg.textContent = data.message;
-          }
-          const percent = Math.max(0, Math.min(100, Number(data.progress || 0)));
-          bar.style.width = percent + '%';
-          meta.textContent = 'Task ID: ' + (data.task_id || taskId) + ' • Status: ' + (data.status || 'unknown');
-          if (data.status === 'complete') {
-            msg.textContent = 'Complete: ' + (data.message || 'Model ready');
-            clearInterval(statusTimer);
-          } else if (data.status === 'error') {
-            msg.innerHTML = '<span class=\"error\">Error: ' + (data.message || 'unknown error') + '</span>';
-            clearInterval(statusTimer);
-          }
+          const meta = document.getElementById('task-meta');
+          if (msg) msg.textContent = data.message || 'Working...';
+          if (bar) bar.style.width = (data.progress || 0) + '%';
+          if (meta) meta.textContent = 'Task ID: ' + (data.task_id || taskId) + ' • Status: ' + (data.status || 'unknown');
         })
         .catch(() => {});
     }
     if (taskId) {
-      updateStatus();
-      const statusTimer = setInterval(updateStatus, 2000);
+      refreshStatus();
+      setInterval(refreshStatus, 2000);
     }
 
-    document.getElementById('chat-form').addEventListener('submit', function(e) {
-      e.preventDefault();
-      const prompt = document.getElementById('chat_prompt').value.trim();
-      const answerBox = document.getElementById('answer-box');
+    document.getElementById('chat-btn').addEventListener('click', function () {
+      const prompt = document.getElementById('prompt').value.trim();
+      const answerEl = document.getElementById('answer');
       if (!prompt) {
-        answerBox.textContent = 'Please enter a prompt first.';
+        answerEl.textContent = 'Please enter a prompt first.';
         return;
       }
-      answerBox.textContent = 'Generating...';
+      answerEl.textContent = 'Generating...';
       fetch('/api/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -715,164 +564,66 @@ INDEX_HTML = """
       })
       .then(r => r.json())
       .then(data => {
-        if (data && data.error) {
-          answerBox.textContent = 'Error: ' + data.error;
+        if (data.error) {
+          answerEl.className = 'answer error';
+          answerEl.textContent = 'Error: ' + data.error;
         } else {
-          answerBox.textContent = data.response || 'No response generated.';
+          answerEl.className = 'answer';
+          answerEl.textContent = data.response || 'No response generated.';
         }
       })
       .catch(err => {
-        answerBox.textContent = 'Chat failed: ' + err;
+        answerEl.className = 'answer error';
+        answerEl.textContent = 'Chat request failed: ' + err;
       });
     });
-
-    document.getElementById('clear-chat').addEventListener('click', function() {
-      document.getElementById('chat_prompt').value = '';
-      document.getElementById('answer-box').textContent = 'No response yet. Download a model above and then ask a question.';
-    });
-  </script>
-</body>
-</html>
-"""
-
-PROGRESS_HTML = """
-<!doctype html>
-<html lang="en">
-<head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Downloading model...</title>
-  <style>
-    body {
-      background: #0b1120;
-      color: #e5e7eb;
-      font-family: system-ui, -apple-system, sans-serif;
-      display: flex;
-      align-items: center;
-      justify-content: center;
-      min-height: 100vh;
-      margin: 0;
-    }
-    .card {
-      width: min(640px, 90vw);
-      background: rgba(17,24,39,0.9);
-      border: 1px solid rgba(255,255,255,0.14);
-      border-radius: 16px;
-      padding: 24px;
-      box-shadow: 0 10px 32px rgba(0,0,0,0.35);
-    }
-    h1 {
-      margin: 0 0 8px 0;
-      font-size: 1.5rem;
-    }
-    .status { color: #cbd5e1; margin-bottom: 14px; }
-    .progress {
-      width: 100%;
-      height: 18px;
-      background: rgba(255,255,255,0.08);
-      border-radius: 999px;
-      overflow: hidden;
-      border: 1px solid rgba(255,255,255,0.1);
-    }
-    .progress-bar {
-      height: 100%;
-      width: 0%;
-      background: linear-gradient(90deg, #34d399, #60a5fa);
-      transition: width 0.2s ease;
-    }
-    .meta {
-      margin-top: 10px;
-      color: #94a3b8;
-      font-size: 0.9rem;
-    }
-    a {
-      display: inline-block;
-      margin-top: 18px;
-      color: #93c5fd;
-      text-decoration: none;
-    }
-  </style>
-</head>
-<body>
-  <div class="card">
-    <h1>Downloading model...</h1>
-    <div id="status" class="status">Starting...</div>
-    <div class="progress"><div id="progress-bar" class="progress-bar"></div></div>
-    <div id="meta" class="meta">Task ID: {{ task_id }}</div>
-    <a href="/">Back to model selection</a>
-  </div>
-
-  <script>
-    const taskId = "{{ task_id }}";
-    function poll() {
-      fetch('/status?task_id=' + encodeURIComponent(taskId))
-        .then(r => r.json())
-        .then(data => {
-          const status = document.getElementById('status');
-          const bar = document.getElementById('progress-bar');
-          const meta = document.getElementById('meta');
-          if (!status || !bar || !meta) return;
-
-          const message = data.message || 'Working...';
-          const pct = Math.max(0, Math.min(100, Number(data.progress || 0)));
-          status.textContent = message;
-          bar.style.width = pct + '%';
-          meta.textContent = 'Task ID: ' + (data.task_id || taskId) + ' • Status: ' + (data.status || 'unknown');
-
-          if (data.status === 'complete') {
-            setTimeout(() => { window.location.href = '/'; }, 1200);
-          } else if (data.status === 'error') {
-            setTimeout(() => { window.location.href = '/'; }, 2500);
-          }
-        })
-        .catch(() => {});
-    }
-    poll();
-    setInterval(poll, 2000);
   </script>
 </body>
 </html>
 """
 
 @app.route("/")
-def index():
-    active_name = ACTIVE_MODEL.get("name") or None
-    return render_template_string(INDEX_HTML, models=MODEL_CATALOG, active_model_name=active_name, task_id=None)
+def home():
+    return render_template_string(INDEX_TEMPLATE, models=RECOMMENDED_MODELS, task_id=None, active_model_name=ACTIVE_MODEL.get("name"))
 
 @app.route("/download", methods=["POST"])
 def download_route():
     try:
-        source = get_model_input_from_request(request.form)
+        source = parse_user_selection(request.form)
         task_id = uuid.uuid4().hex
-        set_task(task_id, "queued", "Queued download...", 0.0)
-        DOWNLOAD_EXECUTOR.submit(download_model_task, task_id, source)
+        set_task(task_id, "queued", "Queued download", 0.0, source.get("name"))
+        threading.Thread(target=download_worker, args=(task_id, source), daemon=True).start()
         return redirect(f"/progress?task_id={task_id}")
     except Exception as exc:
-        logging.exception("Download route failed: %s", exc)
+        logging.exception("Route /download failed: %s", exc)
         return render_template_string(
-            INDEX_HTML,
-            models=MODEL_CATALOG,
-            active_model_name=ACTIVE_MODEL.get("name"),
+            INDEX_TEMPLATE,
+            models=RECOMMENDED_MODELS,
             task_id=None,
-        ) + f"<div style='color:red;padding:12px;'>Error: {exc}</div>"
+            active_model_name=ACTIVE_MODEL.get("name")
+        ) + f"<div class='error'>Error: {exc}</div>"
 
 @app.route("/progress")
 def progress_page():
     task_id = request.args.get("task_id", "").strip()
     if not task_id:
         return redirect("/")
-    return render_template_string(PROGRESS_HTML, task_id=task_id)
+    return render_template_string(INDEX_TEMPLATE, models=RECOMMENDED_MODELS, task_id=task_id, active_model_name=ACTIVE_MODEL.get("name"))
 
 @app.route("/status")
 def status_route():
     task_id = request.args.get("task_id", "").strip()
     if not task_id:
-        return jsonify({"status": "idle", "message": "No active task.", "progress": 0.0})
-    with TASK_LOCK:
-        task = dict(TASKS.get(task_id, {}))
-    if not task:
-        return jsonify({"status": "idle", "message": "No task found.", "progress": 0.0, "task_id": task_id})
-    return jsonify(task)
+        return jsonify({"status": "idle", "message": "No active task", "progress": 0.0})
+    task = TASKS.get(task_id, {})
+    return jsonify({
+        "task_id": task_id,
+        "status": task.get("status", "idle"),
+        "message": task.get("message", "No task found"),
+        "progress": float(task.get("progress", 0.0)),
+        "name": task.get("name"),
+        "model_path": task.get("model_path")
+    })
 
 @app.route("/api/chat", methods=["POST"])
 def api_chat():
@@ -884,21 +635,29 @@ def api_chat():
 
         model_path = ACTIVE_MODEL.get("path") or get_active_model_path()
         if not model_path:
-            return jsonify({"error": "No model file is loaded yet. Download a model first."}), 400
+            return jsonify({"error": "No model downloaded yet. Please choose a model and download it first."}), 400
 
-        response = generate_local_response(prompt, model_path)
+        response = run_local_inference(prompt, model_path)
         return jsonify({"response": response, "model_path": model_path})
     except Exception as exc:
-        logging.exception("Chat request failed: %s", exc)
+        logging.exception("Chat failed: %s", exc)
         return jsonify({"error": str(exc)}), 500
 
-# --------------------------------------------------------------------
-# 6) Startup
-# --------------------------------------------------------------------
+# ------------------------------------------------------------
+# 7) Entry point
+# ------------------------------------------------------------
 if __name__ == "__main__":
-    # Use port 5000 by default; change with PORT env var.
-    port = int(os.environ.get("PORT", "5000"))
     host = os.environ.get("HOST", "0.0.0.0")
-    logging.info("Starting Termux LLM Manager on http://%s:%s", host, port)
-    logging.info("Model storage directory: %s", MODEL_DIR)
+    port = int(os.environ.get("PORT", "5000"))
+
+    print("")
+    print("==============================================")
+    print("Termux LLM Downloader")
+    print("==============================================")
+    print(f"Model directory: {MODEL_DIR}")
+    print(f"Open browser: http://localhost:{port}")
+    print("Run: python app.py")
+    print("==============================================")
+    print("")
+
     app.run(host=host, port=port, debug=False, threaded=True)
