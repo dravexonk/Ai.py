@@ -56,7 +56,7 @@ apt install -y git python clang cmake make ninja
 ```
 ## clone tools command 
 ```
-https://github.com/dravexonk/Ai.py.git
+git clone https://github.com/dravexonk/Ai.py.git
 ```
 
 ## Installation
